@@ -7,14 +7,10 @@
       "version": "latest",
       "enableNonRootDocker": true,
       "moby": true
-    }
+    },
+    // If you want to use the Azure CLI in the container, if no needed you can remove this feature.
+    "ghcr.io/devcontainers/features/azure-cli:1": {}
   },
-  // "forwardPorts": [
-  //   // Azurite default ports. These ports will be forwarded from the container to the host machine and can be accessed by Azure Storage Explorer.
-  //   10000,
-  //   10001,
-  //   10002
-  // ],
   "onCreateCommand": "dotnet restore",
   "postStartCommand": "dotnet dev-certs https --trust",
   "customizations": {

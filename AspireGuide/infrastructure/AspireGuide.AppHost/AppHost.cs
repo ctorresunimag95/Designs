@@ -100,9 +100,29 @@ var tables = storage.AddTables("tables");
 
 #endregion
 
-builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
+# region Key Vault
+
+// The value can be provided in the AppHost configuration file (appsettings.json), set as a user secret, or configured in any other standard configuration.
+// apssettings.json example:
+// "Parameters": {
+//   "KeyVaultUrl": "https://my-key-vault.vault.azure.net/"
+// }
+var keyVaultUrl = builder.AddParameter("KeyVaultUrl");
+
+#endregion
+
+# region Sample Api
+
+var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
     .WithReference(serviceBus, connectionName: "AzureServiceBus")
     .WaitFor(serviceBus)
     .WithReference(blobs, connectionName: "AzureBlobStorage");
+
+if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
+{
+    api.WithEnvironment("KeyVault__Url", keyVaultUrl);
+}
+
+#endregion
 
 builder.Build().Run();
