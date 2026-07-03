@@ -1,6 +1,6 @@
 @AspireGuide.SampleApi_HostAddress = http://localhost:5062
 
-GET {{AspireGuide.SampleApi_HostAddress}}/weatherforecast/
+GET {{AspireGuide.SampleApi_HostAddress}}/health
 Accept: application/json
 
 ###

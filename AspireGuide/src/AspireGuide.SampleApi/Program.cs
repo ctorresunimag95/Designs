@@ -9,6 +9,9 @@ builder.UseAzureKeyVault();
 
 builder.AddServiceDefaults();
 
+builder.Services.AddHealthChecks()
+    .AddSqlServer(builder.Configuration.GetConnectionString("Database")!, name: "database", tags: ["ready"]);
+
 builder.Services.AddServiceBusProcessors();
 
 builder.Services.AddAzureClients(clientBuilder =>
@@ -18,6 +21,8 @@ builder.Services.AddAzureClients(clientBuilder =>
 builder.Services.AddBlobStorageService();
 
 var app = builder.Build();
+
+app.MapDefaultEndpoints();
 
 app.MapGet("/api/files", async (IBlobStorageService blobStorageService, CancellationToken cancellationToken) =>
 {

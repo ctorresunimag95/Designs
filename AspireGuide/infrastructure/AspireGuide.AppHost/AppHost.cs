@@ -10,10 +10,10 @@ var serviceBus = builder.AddAzureServiceBus("serviceBus")
         _ = emulator.WithLifetime(ContainerLifetime.Persistent);
     });
 
-// Add a queue to the service bus with a specific resouce name and queue name
+// Add a queue to the service bus with a specific resource name and queue name
 serviceBus.AddServiceBusQueue(name: "my-queue", queueName: "my.queue.v1");
 
-// Add a queue to the service bus with a specific resouce name and queue name, and configure additional properties
+// Add a queue to the service bus with a specific resource name and queue name, and configure additional properties
 serviceBus.AddServiceBusQueue(name: "my-queue-2", queueName: "my.queue.v2")
     .WithProperties(properties =>
     {
@@ -26,7 +26,7 @@ serviceBus.AddServiceBusQueue(name: "my-queue-2", queueName: "my.queue.v2")
         properties.RequiresSession = false;
     });
 
-// Add a topic to the service bus with a specific resouce name and topic name
+// Add a topic to the service bus with a specific resource name and topic name
 var topic = serviceBus.AddServiceBusTopic(name: "my-topic", topicName: "my.topic.v1")
     .WithProperties(properties =>
     {
@@ -41,9 +41,9 @@ topic.AddServiceBusSubscription("my-topic-subscription")
         subscription.MaxDeliveryCount = 3;
         subscription.RequiresSession = false;
 
-        // Subscription rules allow you to filter messages that are sent to the topic and only allow certain messages to be delivered to the subscription. You can add multiple rules to a subscription, and each rule can have a different filter expression.
-        // If no rules are added, all messages sent to the topic will be delivered to the subscription.
-        // If needed to add rules to the subscription, you can do it like this:
+        // Subscription rules filter messages sent to the topic, allowing only matching messages to be delivered to the subscription. Multiple rules can be added per subscription, each with its own filter expression.
+        // If no rules are defined, all messages sent to the topic will be delivered to the subscription.
+        // To add rules to the subscription, use the following pattern:
 
         /*
         subscription.Rules.Add(new AzureServiceBusRule("app-prop-filter-1")
@@ -62,7 +62,7 @@ topic.AddServiceBusSubscription("my-topic-subscription")
         });
         */
 
-    }); // Resource name will be used as subscription name aswell. If want to have a different subscription name, use the overload with subscriptionName parameter
+    }); // The resource name is also used as the subscription name. To specify a different subscription name, use the overload that accepts a subscriptionName parameter.
 
 topic.WithInteractiveServiceBusTestCommand("send-test-message", "Send Test Message");
 
@@ -102,12 +102,44 @@ var tables = storage.AddTables("tables");
 
 # region Key Vault
 
-// The value can be provided in the AppHost configuration file (appsettings.json), set as a user secret, or configured in any other standard configuration.
-// apssettings.json example:
+// The value can be provided in the AppHost configuration file (appsettings.json), set as a user secret, or through any other standard .NET configuration source.
+// appsettings.json example:
 // "Parameters": {
 //   "KeyVaultUrl": "https://my-key-vault.vault.azure.net/"
 // }
 var keyVaultUrl = builder.AddParameter("KeyVaultUrl");
+
+#endregion
+
+# region SQL Server
+
+// For local development, you can use the following to configure a SQL Server container.
+var sqlPassword = builder.AddParameter("SqlPassword", secret: true);
+
+var sql = builder.AddSqlServer("sql", password: sqlPassword)
+    .WithEndpoint(targetPort: 1433, port: 1433)
+    .WithDataVolume("sql-data-volume")
+    .WithLifetime(ContainerLifetime.Persistent);
+
+var databaseName = "AppDB";
+var creationScript = ScriptHelpers.LoadAllScriptsFromScriptsFolder()
+    .Replace("{{databaseName}}", databaseName);
+
+var db = sql.AddDatabase(databaseName)
+    // To initialize the database with a custom script, use WithCreationScript. The script runs once after the SQL Server container starts and the database is created.
+    .WithCreationScript(creationScript)
+    // Applies Scripts/PostInit/*.sql on every startup once the database resource is ready.
+    .WithPostInitScripts();
+
+// If you want to connect to a existing SQL Server instance, you can do it like this:
+// var sql = builder.AddConnectionString("Sql");
+// The value will be read from the AppHost configuration file (appsettings.json), user secrets.
+// appsettings.json example:
+// "ConnectionStrings": {
+//   "Sql": "Server={{serverName}},{{port}};Initial Catalog={{databaseName}};Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;Authentication="Active Directory Default";"
+// }
+// If the azure server database is configured to use Active Directory authentication, the connection string should be configured to use "Authentication=Active Directory Default" or "Authentication=Active Directory Interactive" depending on the authentication method you want to use. If you want to use a username and password, you can use "Authentication=Sql Password" and provide the username and password in the connection string.
+// In order to make the User Managed Identity authentication work, you should run `az login` in the terminal before running the AppHost, and make sure that the user has the necessary permissions to access the database.
 
 #endregion
 
@@ -116,7 +148,8 @@ var keyVaultUrl = builder.AddParameter("KeyVaultUrl");
 var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
     .WithReference(serviceBus, connectionName: "AzureServiceBus")
     .WaitFor(serviceBus)
-    .WithReference(blobs, connectionName: "AzureBlobStorage");
+    .WithReference(blobs, connectionName: "AzureBlobStorage")
+    .WithReference(db, "Database");
 
 if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
 {

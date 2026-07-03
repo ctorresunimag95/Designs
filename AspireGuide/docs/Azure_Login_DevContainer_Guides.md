@@ -11,8 +11,16 @@
 
  Important: prefer not to connect local development directly to production Key Vault. Use mocks, local config, or a dedicated dev vault with limited privileges.
 
- Option 1 — `az login` (device code) — use when allowed
- - Run inside the devcontainer:
+ Option 1 — Azure CLI interactive login (preferred) and device-code fallback
+ - Preferred: run the interactive `az login` inside the devcontainer — this opens a browser for authentication and uses your user identity:
+
+ ```bash
+ az login
+ az account show
+ az account get-access-token --resource https://vault.azure.net --output json
+ ```
+
+ - If the interactive/browser flow is not possible from the container, try the device-code flow (falls back to a browser on another device):
 
  ```bash
  az login --use-device-code
@@ -20,8 +28,8 @@
  az account get-access-token --resource https://vault.azure.net --output json
  ```
 
- - Pros: quick, uses your user identity and existing permissions.
- - Cons: requires interactive/device flow and may be blocked by corporate SSO/policy. Also less scriptable for CI.
+ - Pros: uses your user identity and existing permissions; quick to set up for ad-hoc tests.
+ - Cons: both flows may be blocked by corporate SSO/policy; interactive flow requires a browser and network access.
 
  Option 2 — Service Principal (recommended when interactive login is unavailable)
  - Create an SP (run where you can create it):
