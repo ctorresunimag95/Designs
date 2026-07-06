@@ -122,14 +122,23 @@ var sql = builder.AddSqlServer("sql", password: sqlPassword)
     .WithLifetime(ContainerLifetime.Persistent);
 
 var databaseName = "AppDB";
-var creationScript = ScriptHelpers.LoadAllScriptsFromScriptsFolder()
-    .Replace("{{databaseName}}", databaseName);
+// var creationScript = ScriptHelpers.LoadAllScriptsFromScriptsFolder()
+//     .Replace("{{databaseName}}", databaseName);
 
 var db = sql.AddDatabase(databaseName)
     // To initialize the database with a custom script, use WithCreationScript. The script runs once after the SQL Server container starts and the database is created.
-    .WithCreationScript(creationScript)
+    //.WithCreationScript(creationScript)
     // Applies Scripts/PostInit/*.sql on every startup once the database resource is ready.
-    .WithPostInitScripts();
+    // .WithPostInitScripts()
+    ;
+
+// The migration service runs EF Core migrations and seeds the database on every AppHost startup.
+// It waits for the SQL Server container to be ready, applies pending migrations, then stops.
+// Services that depend on the database schema must call WaitForCompletion(migrations) to ensure
+// they only start after the database is fully initialized.
+var migrations = builder.AddProject<Projects.AspireGuide_MigrationService>("migrations")
+    .WithReference(db, "Database")
+    .WaitFor(db);
 
 // If you want to connect to a existing SQL Server instance, you can do it like this:
 // var sql = builder.AddConnectionString("Sql");
@@ -149,7 +158,8 @@ var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
     .WithReference(serviceBus, connectionName: "AzureServiceBus")
     .WaitFor(serviceBus)
     .WithReference(blobs, connectionName: "AzureBlobStorage")
-    .WithReference(db, "Database");
+    .WithReference(db, "Database")
+    .WaitForCompletion(migrations);
 
 if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
 {

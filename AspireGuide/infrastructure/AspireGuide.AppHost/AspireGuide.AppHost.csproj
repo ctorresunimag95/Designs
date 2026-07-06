@@ -20,6 +20,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\AspireGuide.MigrationService\AspireGuide.MigrationService.csproj" />
     <ProjectReference Include="..\..\src\AspireGuide.SampleApi\AspireGuide.SampleApi.csproj" />
   </ItemGroup>
 

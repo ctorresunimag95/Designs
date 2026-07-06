@@ -1,9 +1,11 @@
 <Solution>
   <Folder Name="/infrastructure/">
     <Project Path="infrastructure/AspireGuide.AppHost/AspireGuide.AppHost.csproj" />
+    <Project Path="infrastructure/AspireGuide.MigrationService/AspireGuide.MigrationService.csproj" />
     <Project Path="infrastructure/AspireGuide.ServiceDefaults/AspireGuide.ServiceDefaults.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/AspireGuide.Data/AspireGuide.Data.csproj" />
     <Project Path="src/AspireGuide.SampleApi/AspireGuide.SampleApi.csproj" />
   </Folder>
 </Solution>
