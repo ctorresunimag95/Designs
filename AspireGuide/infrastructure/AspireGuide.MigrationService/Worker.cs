@@ -1,8 +1,6 @@
 using System.Diagnostics;
 using AspireGuide.Data;
-using AspireGuide.Data.Entities;
 using Microsoft.EntityFrameworkCore;
-using OpenTelemetry.Trace;
 
 namespace AspireGuide.MigrationService;
 
@@ -45,35 +43,58 @@ public class Worker(
 
     private static async Task SeedDataAsync(AppDbContext dbContext, CancellationToken cancellationToken)
     {
-        if (await dbContext.Todos.AnyAsync(cancellationToken))
-            return;
-
         var strategy = dbContext.Database.CreateExecutionStrategy();
         await strategy.ExecuteAsync(async () =>
         {
-            await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
-
-            await dbContext.Todos.AddRangeAsync(
-                [
-                    new Todo
-                    {
-                        Title = "Setup CI/CD pipeline",
-                        Description = "Configure GitHub Actions workflow for build and deploy.",
-                        IsCompleted = false,
-                        DueDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(7))
-                    },
-                    new Todo
-                    {
-                        Title = "Write unit tests",
-                        Description = "Add unit tests for the data and API layers.",
-                        IsCompleted = false,
-                        DueDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(14))
-                    }
-                ],
-                cancellationToken);
-
-            await dbContext.SaveChangesAsync(cancellationToken);
-            await transaction.CommitAsync(cancellationToken);
+            await ExecuteSeedScriptsAsync(dbContext, cancellationToken);
         });
+
+        // Alternative: Uncomment the following code to seed sample data using the AppDbContext directly.
+        // if (await dbContext.Todos.AnyAsync(cancellationToken))
+        //     return;
+
+        // var strategy = dbContext.Database.CreateExecutionStrategy();
+        // await strategy.ExecuteAsync(async () =>
+        // {
+        //     await using var transaction = await dbContext.Database.BeginTransactionAsync(cancellationToken);
+
+        //     await dbContext.Todos.AddRangeAsync(
+        //         [
+        //             new Todo
+        //             {
+        //                 Title = "Setup CI/CD pipeline",
+        //                 Description = "Configure GitHub Actions workflow for build and deploy.",
+        //                 IsCompleted = false,
+        //                 DueDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(7))
+        //             },
+        //             new Todo
+        //             {
+        //                 Title = "Write unit tests",
+        //                 Description = "Add unit tests for the data and API layers.",
+        //                 IsCompleted = false,
+        //                 DueDate = DateOnly.FromDateTime(DateTime.UtcNow.AddDays(14))
+        //             }
+        //         ],
+        //         cancellationToken);
+
+        //     await dbContext.SaveChangesAsync(cancellationToken);
+        //     await transaction.CommitAsync(cancellationToken);
+        // });
+    }
+
+    private static async Task ExecuteSeedScriptsAsync(AppDbContext dbContext, CancellationToken cancellationToken)
+    {
+        var assembly = typeof(AppDbContext).Assembly;
+        var scripts = assembly.GetManifestResourceNames()
+                              .Where(n => n.StartsWith("AspireGuide.Data.SeedData.") && n.EndsWith(".sql"))
+                              .Order();
+
+        foreach (var resourceName in scripts)
+        {
+            using var stream = assembly.GetManifestResourceStream(resourceName)!;
+            using var reader = new StreamReader(stream);
+            var sql = await reader.ReadToEndAsync(cancellationToken);
+            await dbContext.Database.ExecuteSqlRawAsync(sql, cancellationToken);
+        }
     }
 }
