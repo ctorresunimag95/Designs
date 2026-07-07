@@ -152,6 +152,23 @@ var migrations = builder.AddProject<Projects.AspireGuide_MigrationService>("migr
 
 #endregion
 
+# region Identity
+
+// Keycloak runs as a local container that mimics Azure Active Directory using the OpenID Connect protocol.
+// It is pre-configured with the aspire-guide realm (Keycloak/realm-export.json) which includes:
+//   - sample-api-ui  : public client for interactive user login (Auth Code + PKCE)
+//   - sample-api-m2m : confidential client for service-to-service calls (Client Credentials)
+//   - dev-user / dev-admin test users with api-reader and api-writer realm roles
+//
+// The Authority URL is injected into services via Authentication__Authority.
+// To swap to real Azure AD in production, set these two environment variables — no code changes needed:
+//   Authentication__Authority = https://login.microsoftonline.com/{tenantId}/v2.0
+//   Authentication__Audience  = api://{clientId}
+
+var keycloak = builder.AddLocalKeycloak();
+
+#endregion
+
 # region Sample Api
 
 var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
@@ -159,7 +176,9 @@ var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
     .WaitFor(serviceBus)
     .WithReference(blobs, connectionName: "AzureBlobStorage")
     .WithReference(db, "Database")
-    .WaitForCompletion(migrations);
+    .WaitForCompletion(migrations)
+    .WaitFor(keycloak)
+    .WithKeycloakAuthentication(keycloak);
 
 if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
 {

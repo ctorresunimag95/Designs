@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Aspire.Hosting.Keycloak" Version="13.4.6-preview.1.26319.6" />
     <PackageReference Include="Aspire.Hosting.Azure.Functions" Version="13.4.6" />
     <PackageReference Include="Aspire.Hosting.Azure.KeyVault" Version="13.4.6" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
@@ -28,6 +29,7 @@
 
   <ItemGroup>
     <None Include="Content\**" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Keycloak\**" CopyToOutputDirectory="PreserveNewest" />
     <None Include="Scripts\**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 

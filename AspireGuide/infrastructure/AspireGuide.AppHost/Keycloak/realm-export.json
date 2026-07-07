@@ -1,0 +1,121 @@
+{
+  "realm": "aspire-guide",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "defaultSignatureAlgorithm": "RS256",
+  "accessTokenLifespan": 900,
+  "roles": {
+    "realm": [
+      {
+        "name": "api-reader",
+        "description": "Can read API resources"
+      },
+      {
+        "name": "api-writer",
+        "description": "Can write API resources"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "sample-api-ui",
+      "name": "Sample API UI (Auth Code + PKCE)",
+      "description": "Public client for interactive user login. Use with Auth Code + PKCE flow.",
+      "enabled": true,
+      "publicClient": true,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:*",
+        "https://oauth.pstmn.io/v1/callback"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "protocolMappers": [
+        {
+          "name": "audience-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "sample-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "sample-api-m2m",
+      "name": "Sample API M2M (Client Credentials)",
+      "description": "Confidential client for service-to-service authentication. Use with Client Credentials flow.",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "local-dev-secret",
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "protocolMappers": [
+        {
+          "name": "audience-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "sample-api",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "dev-user",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "dev-user@local.dev",
+      "firstName": "Dev",
+      "lastName": "User",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "Dev@1234",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "api-reader"
+      ]
+    },
+    {
+      "username": "dev-admin",
+      "enabled": true,
+      "emailVerified": true,
+      "email": "dev-admin@local.dev",
+      "firstName": "Dev",
+      "lastName": "Admin",
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "DevAdmin@1234",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "api-reader",
+        "api-writer"
+      ]
+    }
+  ]
+}
