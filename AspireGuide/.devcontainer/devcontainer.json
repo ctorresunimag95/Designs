@@ -9,7 +9,10 @@
       "moby": true
     },
     // If you want to use the Azure CLI in the container, if no needed you can remove this feature.
-    "ghcr.io/devcontainers/features/azure-cli:1": {}
+    "ghcr.io/devcontainers/features/azure-cli:1": {},
+    "ghcr.io/jlaundry/devcontainer-features/azure-functions-core-tools:1": {
+      "version": "4"
+    }
   },
   "onCreateCommand": "dotnet restore",
   "postStartCommand": "dotnet dev-certs https --trust",
@@ -18,7 +21,8 @@
       "extensions": [
         "ms-dotnettools.csdevkit",
         "GitHub.copilot-chat",
-        "microsoft-aspire.aspire-vscode"
+        "microsoft-aspire.aspire-vscode",
+        "ms-azuretools.vscode-azurefunctions"
       ],
       "settings": {
         "remote.autoForwardPorts": true,

@@ -7,5 +7,6 @@
   <Folder Name="/src/">
     <Project Path="src/AspireGuide.Data/AspireGuide.Data.csproj" />
     <Project Path="src/AspireGuide.SampleApi/AspireGuide.SampleApi.csproj" />
+    <Project Path="src/AspireGuide.SampleFunction/AspireGuide.SampleFunction.csproj" />
   </Folder>
 </Solution>

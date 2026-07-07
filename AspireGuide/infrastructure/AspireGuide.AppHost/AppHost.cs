@@ -168,4 +168,16 @@ if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.V
 
 #endregion
 
+# region Sample Function
+
+topic.AddServiceBusSubscription("sample-function-subscription");
+
+var function = builder.AddAzureFunctionsProject<Projects.AspireGuide_SampleFunction>("sample-function")
+    .WithHostStorage(storage)
+    .WaitFor(serviceBus)
+    .WithEnvironment("SERVICE_BUS_CONNECTION_STRING", serviceBus)
+    .WithHttpEndpoint(port: 7184, targetPort: 7071, name: "http", isProxied: true);
+
+#endregion
+
 builder.Build().Run();

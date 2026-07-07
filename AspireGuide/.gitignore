@@ -413,3 +413,5 @@ FodyWeavers.xsd
 .DS_Store
 dist/
 
+# Azure Functions localsettings file
+local.settings.json
