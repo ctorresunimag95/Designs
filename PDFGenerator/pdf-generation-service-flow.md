@@ -12,20 +12,22 @@ flowchart LR
     subgraph API[API host]
         Submit[SubmitDocumentJob]
     end
-    Store[(IJobStore<br/>Azure Table)]
-    Queue{{IJobQueue<br/>Channel / Service Bus}}
+    JobStore[(IJobStore<br/>Azure Table)]
+    ContentStore[(IContentStore<br/>Azure Blob Storage<br/>— swappable for<br/>Cosmos DB / SQL)]
     subgraph Worker[Worker host]
         Process[ProcessDocumentJob]
         Renderer[IDocumentRenderer<br/>IronPDF]
     end
 
     Caller -- "POST /document/generate" --> Submit
-    Submit -- "lookup idempotentKey" --> Store
-    Submit -- "create Pending" --> Store
+    Submit -- "lookup idempotentKey" --> JobStore
+    Submit -- "create Pending" --> JobStore
     Submit -- "202 + jobId" --> Caller
-    Submit -- "publish JobQueuedMessage" --> Queue
-    Queue --> Process
-    Process -- "status writes" --> Store
+    Submit -- "write content blob (jobId)" --> ContentStore
+    ContentStore -- "blob-created event / trigger" --> Process
+    Process -- "read content blob" --> ContentStore
+    Process -- "delete content blob" --> ContentStore
+    Process -- "status writes" --> JobStore
     Process --> Renderer
     Process -- "POST PDF / error" --> Caller
 ```
@@ -40,17 +42,18 @@ sequenceDiagram
     actor C as Caller
     participant A as API (SubmitDocumentJob)
     participant S as IJobStore
-    participant Q as IJobQueue
+    participant B as IContentStore (Blob)
 
     C->>A: POST /api/v1/document/generate (idempotentKey, payload)
     A->>A: Validate request
     A->>S: Lookup by idempotentKey
     alt Key not seen
         A->>S: Create job (Pending)
-        A->>Q: Publish JobQueuedMessage(jobId)
+        A->>B: Write content blob keyed by jobId
+        Note over B: blob-created event fires → triggers Worker
         A-->>C: 202 Accepted + jobId + status link
     else Key seen, still in flight (Pending/Processing/Rendered/NotifyFailed)
-        A-->>C: 202 Accepted + same jobId (no re-enqueue)
+        A-->>C: 202 Accepted + same jobId (no re-write)
     else Key seen, terminal (Succeeded/Failed/DeadLettered)
         A-->>C: 200 OK + same jobId + final status
     end
@@ -63,24 +66,28 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Q as IJobQueue
+    participant B as IContentStore (Blob)
     participant W as Worker (ProcessDocumentJob)
     participant S as IJobStore
     participant R as IDocumentRenderer
     participant N as ICallbackNotifier
     actor C as Caller (callback URL)
 
-    Q->>W: Dequeue JobQueuedMessage(jobId)
+    B->>W: blob-created event (jobId)
+    W->>B: Read content blob (jobId)
     W->>S: status = Processing (attemptCount++)
+
     W->>R: Render(content, options, assets)
 
     alt Render fails
         R-->>W: error
+        W->>B: Delete content blob (jobId)
         W->>S: status = Failed (+ error)
         W->>N: POST errorCallbackUrl
         N->>C: ErrorCallbackPayload
     else Render succeeds
         R-->>W: PDF bytes
+        W->>B: Delete content blob (jobId)
         W->>S: status = Rendered (hold bytes in flight)
         W->>N: POST successCallbackUrl
         N->>C: SuccessCallbackPayload (PDF + metadata)
@@ -131,9 +138,9 @@ Arrows point in the direction of the dependency — everything points inward tow
 ```mermaid
 flowchart TD
     Api[PdfService.Api<br/>driving adapter + composition root]
-    Worker[PdfService.Worker<br/>driving adapter + composition root]
-    Infra[PdfService.Infrastructure<br/>adapters]
-    App[PdfService.Application<br/>use cases + ports]
+    Worker[PdfService.Worker<br/>driving adapter + composition root<br/>triggered by blob-created event]
+    Infra[PdfService.Infrastructure<br/>adapters:<br/>AzureBlobContentStore · AzureTableJobStore<br/>IronPdfRenderer · HttpCallbackNotifier]
+    App[PdfService.Application<br/>use cases + ports:<br/>IContentStore · IJobStore<br/>IDocumentRenderer · ICallbackNotifier]
     Domain[PdfService.Domain<br/>entities + value objects]
     Contracts[PdfService.Contracts<br/>public wire DTOs]
 
