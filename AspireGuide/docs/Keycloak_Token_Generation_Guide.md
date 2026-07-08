@@ -221,3 +221,9 @@ export Authentication__Audience=api://{clientId}
 ```
 
 The same token endpoints and JWT Bearer validation work identically.
+
+## References
+
+- [Keycloak Documentation](https://www.keycloak.org/documentation)
+- [Aspire Keycloak Integration Guide](https://aspire.dev/integrations/security/keycloak/)
+- [OAuth 2.0 and OpenID Connect](https://oauth.net/2/)
