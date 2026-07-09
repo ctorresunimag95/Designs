@@ -15,7 +15,7 @@ public class ServiceBusTrigger
 
     [Function(nameof(ServiceBusTrigger))]
     public void Run(
-        [ServiceBusTrigger(topicName: "my.topic.v1", subscriptionName: "sample-function-subscription", Connection = "SERVICE_BUS_CONNECTION_STRING")]
+        [ServiceBusTrigger(topicName: "my.topic.v1", subscriptionName: "sample-function-subscription", Connection = "SERVICE_BUS")]
         ServiceBusReceivedMessage message,
         ServiceBusMessageActions messageActions)
     {

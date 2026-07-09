@@ -17,6 +17,7 @@ For detailed guidance, refer to the following resources:
 
 - [SQL Configuration Guide](docs/SQL_Configuration_Guide.md) — Step-by-step SQL Server setup and configuration
 - [Azure Login & DevContainer Guide](docs/Azure_Login_DevContainer_Guides.md) — Authentication and local development environment setup
+- [Key Cloack Configuration Guide](docs/Keycloak_Token_Generation_Guide.md) — Keycloak integration and token generation for secure access
 
 ## Getting Started
 

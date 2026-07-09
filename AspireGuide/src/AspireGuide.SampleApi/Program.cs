@@ -1,11 +1,32 @@
+using AspireGuide.SampleApi.AppConfiguration;
 using AspireGuide.SampleApi.BlobStorage;
 using AspireGuide.SampleApi.KeyVault;
 using AspireGuide.SampleApi.ServiceBus;
+using Azure.Core;
 using Microsoft.Extensions.Azure;
+using Microsoft.FeatureManagement;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.UseAzureKeyVault();
+
+builder.Configuration.AddAzureAppConfiguration(options =>
+{
+    options.Connect(builder.Configuration.GetConnectionString("appConfiguration"));
+    options.ConfigureClientOptions(clientOptions => clientOptions.AddPolicy(new RemoveAuthorizationHeaderPolicy(), HttpPipelinePosition.PerRetry));
+    // Reload configuration if any key-values have changed.
+    options.ConfigureRefresh(refreshOptions =>
+        refreshOptions.RegisterAll());
+    options.UseFeatureFlags(featureFlagOptions =>
+    {
+        // When no parameter is passed to the UseFeatureFlags method, it loads all feature flags with no label in your App Configuration store. The default refresh interval of feature flags is 30 seconds.
+        featureFlagOptions.SetRefreshInterval(TimeSpan.FromSeconds(10));
+    });
+});
+// Add Azure App Configuration middleware to the container of services.
+builder.Services.AddAzureAppConfiguration();
+// Add feature management to the container of services.
+builder.Services.AddFeatureManagement();
 
 builder.AddServiceDefaults();
 builder.AddApiAuthentication();
@@ -25,6 +46,8 @@ var app = builder.Build();
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+app.UseAzureAppConfiguration();
 
 app.MapDefaultEndpoints();
 
@@ -55,6 +78,12 @@ app.MapGet("/api/secure/whoami", (HttpContext context) =>
     var claims = context.User.Claims.Select(c => new { c.Type, c.Value });
     return Results.Ok(claims);
 }).RequireAuthorization();
+
+app.MapGet("/api/flag", (IFeatureManager featureManager) =>
+{
+    var isEnabled = featureManager.IsEnabledAsync("Beta");
+    return Results.Ok($"Feature flag 'Beta' is enabled: {isEnabled.Result}");
+});
 
 await app.Services.StartServiceBusProcessorsAsync();
 

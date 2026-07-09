@@ -169,6 +169,20 @@ var keycloak = builder.AddLocalKeycloak();
 
 #endregion
 
+# region App Configuration
+
+var appConfiguration = builder.AddAzureAppConfiguration("appConfiguration")
+    .RunAsEmulator(emulator =>
+    {
+        emulator
+            .WithEnvironment("AZURE_APP_CONFIGURATION_EMULATOR_AUTHENTICATION_ENABLED", "false")
+            .WithHostPort(28000)
+            .WithLifetime(ContainerLifetime.Persistent)
+            .WithDataVolume("appconfig-data");
+    });
+
+#endregion
+
 # region Sample Api
 
 var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
@@ -178,7 +192,8 @@ var api = builder.AddProject<Projects.AspireGuide_SampleApi>("sample-api")
     .WithReference(db, "Database")
     .WaitForCompletion(migrations)
     .WaitFor(keycloak)
-    .WithKeycloakAuthentication(keycloak);
+    .WithKeycloakAuthentication(keycloak)
+    .WithReference(appConfiguration)    .WaitFor(appConfiguration);
 
 if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
 {
@@ -194,7 +209,7 @@ topic.AddServiceBusSubscription("sample-function-subscription");
 var function = builder.AddAzureFunctionsProject<Projects.AspireGuide_SampleFunction>("sample-function")
     .WithHostStorage(storage)
     .WaitFor(serviceBus)
-    .WithEnvironment("SERVICE_BUS_CONNECTION_STRING", serviceBus)
+    .WithEnvironment("SERVICE_BUS", serviceBus)
     .WithHttpEndpoint(port: 7184, targetPort: 7071, name: "http", isProxied: true);
 
 #endregion
