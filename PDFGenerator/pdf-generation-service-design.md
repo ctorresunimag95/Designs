@@ -64,6 +64,26 @@ All endpoints carry an explicit version segment. URL-path versioning (`/api/v{n}
 
 The payload has two levels: top-level audit/routing fields the service infrastructure needs immediately, and a `data` object containing everything the renderer needs.
 
+```jsonc
+{
+  "idempotentKey": "string",           // Caller-assigned dedup key — safe to retry
+  "inputType": "Html | PlainText | HtmlUrl | RawPdf",
+  "successCallbackUrl": "https://...",
+  "errorCallbackUrl": "https://...",
+
+  "data": {
+    "content": "string",              // HTML string | plain text | URL | base64 PDF
+    "assets": {                       // Named binary assets — substituted as data: URIs before rendering
+      "logo": "<base64>",
+      "signature": "<base64>"
+    },
+    "renderOptions": { /* see below */ },
+    "header": { /* optional — see below */ },
+    "footer": { /* optional — see below */ }
+  }
+}
+```
+
 **Top-level fields:**
 
 | Field | Description |
@@ -79,15 +99,109 @@ The payload has two levels: top-level audit/routing fields the service infrastru
 |---|---|
 | `content` | HTML string, plain text, a URL to render, or base64-encoded PDF depending on `inputType` |
 | `assets` | Named binary assets as a key-value map (name → base64). Referenced by name inside `content`. |
-| `renderOptions` | Page size, orientation, margins, and custom metadata key-value pairs to embed in the PDF |
+| `renderOptions` | Page size, orientation, margins, DPI, and custom metadata key-value pairs to embed in the PDF |
 | `header` | Optional document header — see below |
 | `footer` | Optional document footer — see below |
 
-**Header / Footer shape:**
+**Response:** `202 Accepted`
 
-Both share the same structure. Content can be plain text or an HTML fragment. Left, center, and right zones are independently configurable. Page number and total-page tokens (e.g. `{page}` / `{total}`) are substituted at render time. A height value controls band height.
+```jsonc
+{
+  "jobId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "status": "Pending",
+  "statusLink": "/api/v1/document/jobs/3fa85f64-5717-4562-b3fc-2c963f66afa6"
+}
+```
 
-**Response:** `202 Accepted` with a `jobId` and a status link for polling.
+---
+
+### `renderOptions` Reference
+
+All fields are optional. Omitted fields use the renderer's defaults.
+
+| Field | Type | Accepted values | Default | Notes |
+|---|---|---|---|---|
+| `paperSize` | string | `A0` `A1` `A2` `A3` `A4` `A5` `A6` `Letter` `Legal` `Tabloid` `Ledger` | `A4` | Standard paper size names |
+| `orientation` | string | `Portrait` `Landscape` | `Portrait` | |
+| `margins` | object | — | 20 mm all sides | See sub-fields below |
+| `margins.top` | number | ≥ 0 | `20` | Millimetres |
+| `margins.right` | number | ≥ 0 | `20` | Millimetres |
+| `margins.bottom` | number | ≥ 0 | `20` | Millimetres |
+| `margins.left` | number | ≥ 0 | `20` | Millimetres |
+| `dpi` | integer | `72` `96` `150` `300` | `96` | Higher values increase output file size |
+| `metadata` | object | key-value string pairs | — | Embedded as PDF document properties (Title, Author, Subject, Keywords, or custom XMP keys) |
+
+```jsonc
+"renderOptions": {
+  "paperSize": "A4",
+  "orientation": "Landscape",
+  "margins": { "top": 15, "right": 20, "bottom": 15, "left": 20 },
+  "dpi": 150,
+  "metadata": {
+    "Title": "Invoice #4521",
+    "Author": "Billing Service",
+    "Subject": "Monthly invoice"
+  }
+}
+```
+
+---
+
+### Header / Footer Shape
+
+Both `header` and `footer` share the same structure. All fields are optional.
+
+| Field | Type | Description |
+|---|---|---|
+| `height` | number | Band height in millimetres |
+| `left` | string | Content for the left zone (plain text or HTML fragment) |
+| `center` | string | Content for the centre zone |
+| `right` | string | Content for the right zone |
+
+Token substitution at render time:
+
+| Token | Replaced with |
+|---|---|
+| `{page}` | Current page number |
+| `{total}` | Total page count |
+
+```jsonc
+"footer": {
+  "height": 12,
+  "left": "Confidential",
+  "center": "Page {page} of {total}",
+  "right": "Generated 2026-07-09"
+}
+```
+
+---
+
+### Callback Payloads
+
+**Success** (`POST successCallbackUrl`):
+
+```jsonc
+{
+  "jobId": "3fa85f64-...",
+  "idempotentKey": "invoice-4521-v1",
+  "completedAt": "2026-07-09T10:00:00Z",
+  "pdf": "<base64-encoded PDF bytes>"
+}
+```
+
+**Error** (`POST errorCallbackUrl`):
+
+```jsonc
+{
+  "jobId": "3fa85f64-...",
+  "idempotentKey": "invoice-4521-v1",
+  "failedAt": "2026-07-09T10:00:01Z",
+  "error": {
+    "code": "RenderFailed",
+    "message": "..."
+  }
+}
+```
 
 ---
 
@@ -170,13 +284,35 @@ The solution follows **hexagonal (ports & adapters) / clean architecture**. Depe
 The innermost layer. Entities and value objects with no framework or infrastructure references: the `Job` entity, the `JobStatus` enum and its allowed transitions, `RenderOptions`, and the header/footer model. Zero dependencies.
 
 ### Application (`PdfService.Application`)
-The core. Holds the **use cases** and the **ports** they depend on. Depends only on `Domain`.
+The core. Holds the **use cases** and the **ports** they depend on. Depends only on `Domain`. All use cases are host-agnostic — the API and Worker are simply driving adapters that invoke them.
 
-- **Use cases:**
-  - `SubmitDocumentJob` — validate, check `IJobStore` for the `idempotentKey`, create the `Pending` record, write the serialised job content (HTML, assets, render options) to `IContentStore` as a blob keyed by `jobId`. Driven by the API host.
-  - `ProcessDocumentJob` — triggered by a blob-created event; read the content blob from `IContentStore`, render, write status transitions to `IJobStore`, delete the content blob after processing (whether success or failure), deliver the callback. Driven by the Worker host.
-- **Output ports (driven)** — interfaces the core needs from the outside world: `IJobStore`, `IContentStore`, `IDocumentRenderer`, `ICallbackNotifier`.
-- **Input ports (driving)** — optional `ISubmitDocumentJob` / `IProcessDocumentJob` interfaces; introduce only when a host/test needs to mock the use case. Start by injecting the use case classes directly.
+#### Use Cases
+
+**Driven by the API host:**
+
+| Use Case | Responsibility | Ports used |
+|---|---|---|
+| `SubmitDocumentJob` | Validate request; look up `idempotentKey` in the job store (idempotency check); create the job record in `Pending` state; write serialised job content (HTML, assets, render options) to the content store keyed by `jobId`; return the `jobId` to the caller. | `IJobStore` (read + write), `IContentStore` (write) |
+| `GetJobStatus` | Look up a job by `jobId` and return its current status and metadata. Used by callers who prefer polling over callbacks. | `IJobStore` (read) |
+
+**Driven by the Worker host:**
+
+| Use Case | Responsibility | Ports used |
+|---|---|---|
+| `ProcessDocumentJob` | Read the content blob from the content store; transition status to `Processing`; render the PDF; delete the content blob; deliver the result to the caller's callback URL; write the final status transition (`Succeeded`, `Failed`, `NotifyFailed`, or `DeadLettered`). | `IContentStore` (read + delete), `IJobStore` (write), `IDocumentRenderer`, `ICallbackNotifier` |
+
+#### Output Ports (driven — interfaces the core declares, infrastructure implements)
+
+| Port | Responsibility | Default adapter |
+|---|---|---|
+| `IJobStore` | Persist and query job records; idempotency lookup by `idempotentKey`; status transitions. | `AzureTableJobStore` |
+| `IContentStore` | Write, read, and delete the serialised job content blob between submission and processing. | `AzureBlobContentStore` |
+| `IDocumentRenderer` | Render HTML / plain-text / URL / raw-PDF content to a PDF byte array. | `IronPdfRenderer` |
+| `ICallbackNotifier` | POST the success payload (PDF bytes + metadata) or error payload to the caller's callback URL. | `HttpCallbackNotifier` |
+
+#### Input Ports (driving — optional)
+
+Optional `ISubmitDocumentJob` / `IProcessDocumentJob` / `IGetJobStatus` interfaces. Introduce only when a host or test needs to mock the use case boundary. Default: inject the use case classes directly.
 
 ### Contracts (`PdfService.Contracts`)
 The **public, caller-facing wire contract** — the only contract a third-party client needs. Shippable as a client NuGet. Plain DTOs and enums, no behavior, no infrastructure refs:
