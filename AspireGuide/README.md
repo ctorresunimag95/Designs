@@ -1,6 +1,6 @@
 # AspireGuide
 
-AspireGuide is a starter-friendly resource for configuring Microsoft Azure Aspire. This project provides practical snippets, code samples, and guidance to help you quickly set up and configure essential Azure services in your Aspire projects.
+AspireGuide is a starter-friendly reference for configuring Azure services in .NET Aspire applications. It includes practical snippets, working samples, and guidance to help you set up common Azure integrations quickly.
 
 ## What's Included
 
@@ -16,21 +16,21 @@ This guide covers configuration patterns for:
 For detailed guidance, refer to the following resources:
 
 - [SQL Configuration Guide](docs/SQL_Configuration_Guide.md) — Step-by-step SQL Server setup and configuration
-- [Azure Login & DevContainer Guide](docs/Azure_Login_DevContainer_Guides.md) — Authentication and local development environment setup
-- [Key Cloack Configuration Guide](docs/Keycloak_Token_Generation_Guide.md) — Keycloak integration and token generation for secure access
+- [Azure Login & Dev Container Guide](docs/Azure_Login_DevContainer_Guides.md) — Authentication and local development environment setup
+- [Keycloak Token Generation Guide](docs/Keycloak_Token_Generation_Guide.md) — Keycloak integration and token generation for secure access
 
 ## Getting Started
 
 ### Sample AppHost Configuration
 
-The [infrastructure/AspireGuide.AppHost/AppHost.cs](infrastructure/AspireGuide.AppHost/AppHost.cs) file contains a complete working sample of how to configure all supported Azure services. This file demonstrates:
+The [infrastructure/AspireGuide.AppHost/AppHost.cs](infrastructure/AspireGuide.AppHost/AppHost.cs) file contains a complete sample showing how to configure all supported Azure services. It demonstrates:
 
 - Service Bus queues, topics, and subscriptions with property configurations
 - Azure Storage (Blobs, Queues, Tables) with Azurite emulator setup
 - Key Vault integration
 - SQL Server with database initialization and EF Core migrations
 
-You can use this file as a reference for your own projects or clone/copy it directly into your Aspire AppHost as a starting point.
+You can use this file as a reference for your own projects or copy parts of it into your Aspire AppHost as a starting point.
 
 ### Browse Examples
 

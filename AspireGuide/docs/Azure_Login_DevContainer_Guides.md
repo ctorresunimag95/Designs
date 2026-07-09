@@ -1,75 +1,87 @@
- # Azure Login & Key Vault from the devcontainer
+# Azure Login & Key Vault from a Dev Container
 
- This doc explains why you might need Key Vault access from a devcontainer and two approaches to authenticate:
- 1. `az login` (device-code) — use if your organization allows interactive/device flows.
- 2. Service Principal (recommended when interactive login is not possible).
+This guide explains when you might need Key Vault access from a dev container and outlines two authentication options:
 
- Why you might need this
- - Running integration tests or debugging code that reads secrets directly from Key Vault.
- - Validating Key Vault access policies or RBAC in a development scenario.
- - Short-lived troubleshooting that requires a real secret value.
+1. `az login` for interactive browser-based sign-in, with `az login --use-device-code` as a fallback.
+2. A service principal, recommended when interactive sign-in is not available.
 
- Important: prefer not to connect local development directly to production Key Vault. Use mocks, local config, or a dedicated dev vault with limited privileges.
+## When You Might Need This
 
- Option 1 — Azure CLI interactive login (preferred) and device-code fallback
- - Preferred: run the interactive `az login` inside the devcontainer — this opens a browser for authentication and uses your user identity:
+- Running integration tests or debugging code that reads secrets directly from Key Vault.
+- Validating Key Vault access policies or RBAC during development.
+- Performing short-lived troubleshooting that requires a real secret value.
 
- ```bash
- az login
- az account show
- az account get-access-token --resource https://vault.azure.net --output json
- ```
+Important: avoid connecting local development directly to a production Key Vault when possible. Prefer mocks, local configuration, or a dedicated development vault with limited privileges.
 
- - If the interactive/browser flow is not possible from the container, try the device-code flow (falls back to a browser on another device):
+## Option 1: Azure CLI Interactive Login
 
- ```bash
- az login --use-device-code
- az account show
- az account get-access-token --resource https://vault.azure.net --output json
- ```
+Preferred: run interactive `az login` inside the dev container. This opens a browser for authentication and uses your user identity.
 
- - Pros: uses your user identity and existing permissions; quick to set up for ad-hoc tests.
- - Cons: both flows may be blocked by corporate SSO/policy; interactive flow requires a browser and network access.
+```bash
+az login
+az account show
+az account get-access-token --resource https://vault.azure.net --output json
+```
 
- Option 2 — Service Principal (recommended when interactive login is unavailable)
- - Create an SP (run where you can create it):
+If browser-based sign-in is not possible from the container, use device code instead. This lets you complete authentication from another device or browser session.
 
- ```bash
- az ad sp create-for-rbac --name "dev-my-sp" --role Reader \
-   --scopes /subscriptions/<SUBSCRIPTION_ID> \
-   --sdk-auth
- ```
+```bash
+az login --use-device-code
+az account show
+az account get-access-token --resource https://vault.azure.net --output json
+```
 
- - The command returns JSON with `clientId`, `clientSecret`, `tenantId`, and `subscriptionId`.
- - Add these to your `.devcontainer/devcontainer.json` as container environment variables (don’t commit secrets):
+- Pros: uses your existing user identity and permissions, and is quick to set up for ad hoc testing.
+- Cons: both flows may be blocked by corporate SSO or policy; interactive sign-in also requires browser and network access.
 
- ```json
- "containerEnv": {
-   "AZURE_CLIENT_ID": "<client-id>",
-   "AZURE_TENANT_ID": "<tenant-id>",
-   "AZURE_CLIENT_SECRET": "<client-secret>",
-   "AZURE_SUBSCRIPTION_ID": "<subscription-id>"
- }
- ```
+## Option 2: Service Principal
 
- - `DefaultAzureCredential` will use `EnvironmentCredential` when these env vars are present.
- - Ensure the SP has Key Vault access (RBAC role or access policies) for the vault you need to contact.
+Use a service principal when interactive sign-in is unavailable.
 
- Rebuild the devcontainer
- - In VS Code: Command Palette → **Dev Containers: Rebuild and Reopen in Container**
- - Or CLI: `devcontainer rebuild --workspace-folder .`
+Create the service principal in an environment where you have permission to do so:
 
- Quick verification inside the container
- ```bash
- az --version
- az account show
- az account get-access-token --resource https://vault.azure.net --output json
- ```
+```bash
+az ad sp create-for-rbac --name "dev-my-sp" --role Reader \
+  --scopes /subscriptions/<SUBSCRIPTION_ID> \
+  --sdk-auth
+```
 
- Additional notes
- - If you previously mounted host `~/.azure` into the container, note that this was removed — the SP approach does not need that mount.
- - Do not commit secrets to source control. Use VS Code secret storage, devcontainer secrets, or CI secret injection.
- - For anything running in Azure (App Service, AKS, etc.), prefer managed identities instead of SPs.
+The command returns JSON that includes `clientId`, `clientSecret`, `tenantId`, and `subscriptionId`.
 
- Security reminder
- - Use short-lived credentials where possible and rotate secrets regularly.
+Add these values to `.devcontainer/devcontainer.json` as container environment variables, and do not commit secrets:
+
+```json
+"containerEnv": {
+  "AZURE_CLIENT_ID": "<client-id>",
+  "AZURE_TENANT_ID": "<tenant-id>",
+  "AZURE_CLIENT_SECRET": "<client-secret>",
+  "AZURE_SUBSCRIPTION_ID": "<subscription-id>"
+}
+```
+
+`DefaultAzureCredential` uses `EnvironmentCredential` when these environment variables are present.
+
+Make sure the service principal has Key Vault access through either RBAC or access policies for the vault you need to reach.
+
+## Rebuild the Dev Container
+
+- In VS Code, run **Dev Containers: Rebuild and Reopen in Container** from the Command Palette.
+- From the CLI, run `devcontainer rebuild --workspace-folder .`.
+
+## Verify Access Inside the Container
+
+```bash
+az --version
+az account show
+az account get-access-token --resource https://vault.azure.net --output json
+```
+
+## Additional Notes
+
+- If you previously mounted host `~/.azure` into the container, note that this was removed. The service principal approach does not require that mount.
+- Do not commit secrets to source control. Use VS Code secret storage, dev container secrets, or CI secret injection instead.
+- For workloads running in Azure, such as App Service or AKS, prefer managed identities over service principals.
+
+## Security Reminder
+
+- Use short-lived credentials when possible, and rotate secrets regularly.

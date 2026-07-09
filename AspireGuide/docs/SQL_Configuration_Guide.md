@@ -1,9 +1,9 @@
 # SQL Server Configuration Guide
 
-This doc covers three topics:
+This guide covers three topics:
 
 1. Local SQL Server container for development (via Aspire).
-2. Connecting to an existing Azure SQL database using Active Directory / Managed Identity.
+2. Connecting to an existing Azure SQL database using Microsoft Entra ID or Managed Identity.
 3. Running database migrations — automated (EF Core migration service) and manual (SQL script).
 
 ---
@@ -36,9 +36,9 @@ var db = sql.AddDatabase("AppDB");
 
 ---
 
-## 2. Connecting to an existing Azure SQL database (Active Directory / Managed Identity)
+## 2. Connecting to an Existing Azure SQL Database (Microsoft Entra ID / Managed Identity)
 
-When you want to point your local AppHost at a real Azure SQL instance instead of the container, replace the `AddSqlServer` block with `AddConnectionString`:
+When you want to point your local AppHost at an existing Azure SQL database instead of the local container, replace the `AddSqlServer` block with `AddConnectionString`:
 
 ```csharp
 // AppHost.cs — replace the local SQL block with this:
@@ -124,7 +124,7 @@ The next `dotnet run` on the AppHost will apply it automatically.
 
 Use this when you need to apply migrations to an environment where running the full AppHost is not practical (e.g. a production database with restricted access, a CI job that only has a connection string).
 
-**run a creation script on first start**
+**Run a creation script on first start**
 
 ```csharp
 var creationScript = File.ReadAllText("Scripts/init.sql");
@@ -134,7 +134,7 @@ var db = sql.AddDatabase("AppDB")
 
 The script runs once, immediately after the container starts and the database is created. Use it for schema bootstrapping when you are not using EF Core migrations.
 
-**run post-init scripts on every startup**
+**Run post-init scripts on every startup**
 
 ```csharp
 var db = sql.AddDatabase("AppDB")

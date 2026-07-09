@@ -50,9 +50,9 @@ curl http://localhost:{api-port}/api/secure/files \
 
 ---
 
-## Normal User — Resource Owner Password Flow
+## User Login — Resource Owner Password Flow
 
-Use this flow for interactive applications where a user provides their username and password directly.
+Use this flow for development and test scenarios where a user provides a username and password directly.
 
 ### Test Users
 
@@ -211,16 +211,16 @@ After modifying `realm-export.json`:
 
 ---
 
-## Switching to Real Azure AD
+## Switching to Microsoft Entra ID
 
-To use this with real Azure AD instead of local Keycloak, only the environment variables change — **no code modifications required**:
+To use Microsoft Entra ID instead of local Keycloak, update the environment variables shown below. In most cases, the application code does not need to change if it already relies on standard JWT bearer authentication.
 
 ```bash
 export Authentication__Authority=https://login.microsoftonline.com/{tenantId}/v2.0
 export Authentication__Audience=api://{clientId}
 ```
 
-The same token endpoints and JWT Bearer validation work identically.
+The API-side JWT bearer validation flow remains the same, but token issuance moves from the local Keycloak endpoint to Microsoft Entra ID.
 
 ## References
 
