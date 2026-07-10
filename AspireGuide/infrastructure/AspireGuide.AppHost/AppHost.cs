@@ -36,7 +36,7 @@ topic.AddServiceBusSubscription("my-topic-subscription")
     .WithProperties(subscription =>
     {
         subscription.DeadLetteringOnMessageExpiration = true;
-        subscription.DefaultMessageTimeToLive = TimeSpan.FromMinutes(5); // PT5M
+        subscription.DefaultMessageTimeToLive = TimeSpan.FromMinutes(1); // PT1M
         subscription.LockDuration = TimeSpan.FromMinutes(1); // PT1M
         subscription.MaxDeliveryCount = 3;
         subscription.RequiresSession = false;
@@ -211,6 +211,17 @@ var function = builder.AddAzureFunctionsProject<Projects.AspireGuide_SampleFunct
     .WaitFor(serviceBus)
     .WithEnvironment("SERVICE_BUS", serviceBus)
     .WithHttpEndpoint(port: 7184, targetPort: 7071, name: "http", isProxied: true);
+
+#endregion
+
+# region Service Bus Explorer
+
+// Local troubleshooting UI (Blazor Server): publish messages to queues/topics and
+// peek / resubmit / purge dead-letter and active messages against the Service Bus emulator.
+builder.AddProject<Projects.AspireGuide_ServiceBusExplorer>("sb-explorer")
+    .WithReference(serviceBus, connectionName: "AzureServiceBus")
+    .WaitFor(serviceBus)
+    .WithHttpEndpoint(port: 59256, name: "http", isProxied: true);
 
 #endregion
 

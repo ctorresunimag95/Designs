@@ -25,6 +25,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\AspireGuide.SampleFunction\AspireGuide.SampleFunction.csproj" />
     <ProjectReference Include="..\AspireGuide.MigrationService\AspireGuide.MigrationService.csproj" />
+    <ProjectReference Include="..\AspireGuide.ServiceBusExplorer\AspireGuide.ServiceBusExplorer.csproj" />
     <ProjectReference Include="..\..\src\AspireGuide.SampleApi\AspireGuide.SampleApi.csproj" />
   </ItemGroup>
 

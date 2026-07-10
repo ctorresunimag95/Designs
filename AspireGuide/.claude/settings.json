@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"AspireGuide\")",
+      "Bash(nohup dotnet run --launch-profile http)",
+      "Bash(powershell -Command \"Get-Process -Name '*AspireGuide*' -ErrorAction SilentlyContinue | Stop-Process -Force\")"
+    ]
+  }
+}

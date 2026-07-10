@@ -1,0 +1,137 @@
+@page "/"
+@rendermode InteractiveServer
+@inject ServiceBusBrowser Browser
+@inject IOptions<EntityCatalogOptions> Catalog
+
+<h1>Publish a message</h1>
+
+<div class="panel">
+    <div class="row">
+        <div class="field" style="min-width: 260px;">
+            <label>Target (queue or topic)</label>
+            <select @bind="_selectedTarget" aria-label="Target queue or topic">
+                <option value="">— choose —</option>
+                @foreach (var q in Catalog.Value.Queues)
+                {
+                    <option value="@q">queue: @q</option>
+                }
+                @foreach (var t in Catalog.Value.Topics)
+                {
+                    <option value="@t.Name">topic: @t.Name</option>
+                }
+                <option value="@CustomValue">✎ custom…</option>
+            </select>
+        </div>
+        @if (_selectedTarget == CustomValue)
+        {
+            <div class="field" style="min-width: 260px;">
+                <label>Custom entity name</label>
+                <input @bind="_customEntity" @bind:event="oninput" placeholder="my.queue.v1" aria-label="Custom entity name" />
+            </div>
+        }
+    </div>
+
+    <div class="row">
+        <div class="field" style="min-width: 200px;">
+            <label>Subject (optional)</label>
+            <input @bind="_subject" />
+        </div>
+        <div class="field" style="min-width: 200px;">
+            <label>Correlation Id (optional)</label>
+            <input @bind="_correlationId" />
+        </div>
+        <div class="field" style="min-width: 200px;">
+            <label>Content Type (optional)</label>
+            <input @bind="_contentType" placeholder="application/json" />
+        </div>
+    </div>
+
+    <div class="field">
+        <label>Body</label>
+        <textarea @bind="_body" @bind:event="oninput" placeholder="{ &quot;hello&quot;: &quot;world&quot; }" aria-label="Message body"></textarea>
+    </div>
+
+    <div class="field">
+        <label>Application properties (optional)</label>
+        @foreach (var prop in _properties)
+        {
+            <div class="kv-row">
+                <input placeholder="key" @bind="prop.Key" />
+                <input placeholder="value" @bind="prop.Value" />
+                <button class="secondary" @onclick="() => _properties.Remove(prop)">✕</button>
+            </div>
+        }
+        <button class="secondary" @onclick="@(() => _properties.Add(new KeyValueEntry()))">+ add property</button>
+    </div>
+
+    <p class="muted">Select a target and enter a message body before sending.</p>
+
+    <button type="button" @onclick="SendAsync" disabled="@_sending">
+        @(_sending ? "Sending…" : "Send")
+    </button>
+</div>
+
+@if (_result is not null)
+{
+    <div class="alert @(_result.Value.ok ? "ok" : "err")">@_result.Value.message</div>
+}
+
+@code {
+    private const string CustomValue = "__custom__";
+
+    private string _selectedTarget = "";
+    private string _customEntity = "";
+    private string _subject = "";
+    private string _correlationId = "";
+    private string _contentType = "";
+    private string _body = "";
+    private readonly List<KeyValueEntry> _properties = new();
+    private bool _sending;
+    private (bool ok, string message)? _result;
+
+    private string EffectiveEntity =>
+        _selectedTarget == CustomValue ? _customEntity.Trim() : _selectedTarget;
+
+    private async Task SendAsync()
+    {
+        _result = null;
+        var entity = EffectiveEntity;
+        if (string.IsNullOrWhiteSpace(entity))
+        {
+            _result = (false, "Choose a target queue/topic (or enter a custom entity name) before sending.");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_body))
+        {
+            _result = (false, "Enter a message body before sending.");
+            return;
+        }
+
+        _sending = true;
+        try
+        {
+            var props = _properties
+                .Where(p => !string.IsNullOrWhiteSpace(p.Key))
+                .GroupBy(p => p.Key.Trim(), StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.Last().Value ?? "", StringComparer.OrdinalIgnoreCase);
+
+            await Browser.SendAsync(entity, _body, props, _subject, _correlationId, _contentType);
+            _result = (true, $"Sent message to '{entity}'.");
+        }
+        catch (Exception ex)
+        {
+            _result = (false, $"Send failed: {ex.Message}");
+        }
+        finally
+        {
+            _sending = false;
+        }
+    }
+
+    private sealed class KeyValueEntry
+    {
+        public string Key { get; set; } = "";
+        public string Value { get; set; } = "";
+    }
+}
