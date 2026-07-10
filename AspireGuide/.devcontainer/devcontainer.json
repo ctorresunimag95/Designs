@@ -22,7 +22,8 @@
         "ms-dotnettools.csdevkit",
         "GitHub.copilot-chat",
         "microsoft-aspire.aspire-vscode",
-        "ms-azuretools.vscode-azurefunctions"
+        "ms-azuretools.vscode-azurefunctions",
+        "bruno-api-client.bruno"
       ],
       "settings": {
         "remote.autoForwardPorts": true,

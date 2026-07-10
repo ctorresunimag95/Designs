@@ -67,7 +67,8 @@
                 </button>
             </div>
             <div class="field">
-                <button class="danger" @onclick="PurgeAsync" disabled="@(_busy || string.IsNullOrWhiteSpace(Entity) || _messages is null || _messages.Count == 0)">
+                <button class="danger" @onclick="PurgeAsync"
+                        disabled="@(_busy || string.IsNullOrWhiteSpace(Entity) || _messages is null || _messages.Count == 0)">
                     Purge DLQ
                 </button>
             </div>
@@ -142,7 +143,8 @@
                             <td>
                                 @if (m.Body is not null && m.Body.Length > BodyPreviewLength)
                                 {
-                                    <pre class="body-preview" @onclick="() => OpenPreview(m.Body)">@m.Body[..BodyPreviewLength]<span class="muted">… (click to expand)</span></pre>
+                                    <pre class="body-preview"
+                                         @onclick="() => OpenPreview(m.Body)">@m.Body[..BodyPreviewLength]<span class="muted">… (click to expand)</span></pre>
                                 }
                                 else
                                 {

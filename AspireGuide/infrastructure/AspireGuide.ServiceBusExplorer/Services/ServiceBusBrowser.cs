@@ -43,10 +43,9 @@ public sealed class ServiceBusBrowser
         {
             foreach (var (key, value) in applicationProperties)
             {
-                if (!string.IsNullOrWhiteSpace(key))
-                {
-                    message.ApplicationProperties[key] = value;
-                }
+                if (string.IsNullOrWhiteSpace(key)) continue;
+
+                message.ApplicationProperties[key] = value;
             }
         }
 
