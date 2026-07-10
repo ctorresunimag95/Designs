@@ -1,25 +1,92 @@
-# Keycloak Token Generation Guide
+# Keycloak Authentication Configuration Guide
 
-This guide explains how to generate access tokens from the local Keycloak instance for both user authentication and machine-to-machine communication.
+Use this guide to configure Keycloak for local development, connect it to a .NET Aspire AppHost, and test user and service-to-service authentication.
 
-## Prerequisites
+For the complete Aspire integration API, see [Keycloak integration | Aspire](https://aspire.dev/integrations/security/keycloak/). For running Keycloak directly in Docker, see [Docker - Keycloak](https://www.keycloak.org/getting-started/getting-started-docker).
 
-- AspireGuide AppHost is running (`dotnet run --project infrastructure/AspireGuide.AppHost`)
-- Keycloak is accessible at `http://localhost:8080`
-- Realm: `aspire-guide`
+## 1. Choose how to run Keycloak
 
----
+Use the Aspire-managed container when working with this repository. Use the standalone Docker command when testing Keycloak independently.
 
-## Machine-to-Machine (M2M) — Client Credentials Flow
+### Option A: Run through Aspire
 
-Use this flow for service-to-service authentication where no user is involved.
+The repository registers Keycloak with a stable port, persistent data volume, realm import, and OTLP exporter:
 
-### Configuration
-- **Client ID**: `sample-api-m2m`
-- **Client Secret**: `local-dev-secret`
-- **Grant Type**: `client_credentials`
+```csharp
+var keycloak = builder.AddKeycloak("keycloak", port: 8080)
+    .WithOtlpExporter()
+    .WithRealmImport(Path.Combine(AppContext.BaseDirectory, "Keycloak"))
+    .WithDataVolume("keycloak-data")
+    .WithLifetime(ContainerLifetime.Persistent);
+```
 
-### curl Command
+Start the AppHost from the repository root:
+
+```bash
+dotnet run --project infrastructure/AspireGuide.AppHost
+```
+
+The application realm is available at:
+
+```text
+http://localhost:8080/realms/aspire-guide
+```
+
+A stable port is useful for local OIDC clients because browser cookies and redirect configuration can persist between AppHost runs.
+
+### Option B: Run Keycloak directly with Docker
+
+Use this command when the Aspire AppHost is not required:
+
+```bash
+docker run --name keycloak -p 127.0.0.1:8080:8080 \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
+  -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
+  quay.io/keycloak/keycloak:26.7.0 start-dev
+```
+
+Open the [Keycloak Admin Console](http://localhost:8080/admin) and sign in with the bootstrap administrator credentials. Change development credentials before using the instance for anything beyond local testing.
+
+## 2. Understand the repository realm
+
+The Aspire AppHost imports the realm from:
+
+```text
+infrastructure/AspireGuide.AppHost/Keycloak/realm-export.json
+```
+
+The imported realm is `aspire-guide` and contains:
+
+| Client or user | Type | Purpose |
+| --- | --- | --- |
+| `sample-api-ui` | Public client | Development user login with direct access grants |
+| `sample-api-m2m` | Confidential client | Client credentials flow |
+| `dev-user` | Test user | `api-reader` role |
+| `dev-admin` | Test user | `api-reader` and `api-writer` roles |
+
+The AppHost injects the authority into the API as `Authentication__Authority` and waits for Keycloak before starting the API.
+
+## 3. Add or modify a realm configuration
+
+For local development, edit the `users`, `clients`, or roles in `realm-export.json`. Keep test passwords and client secrets local-only.
+
+After changing the import file:
+
+1. Stop the AppHost.
+2. Remove the persistent volume so Keycloak does not reuse the old realm:
+
+   ```bash
+   docker volume rm keycloak-data
+   ```
+
+3. Start the AppHost again.
+4. Confirm the realm and clients in the Admin Console.
+
+For a standalone Docker container, create a realm, user, and client through the Admin Console by following the [official Keycloak Docker guide](https://www.keycloak.org/getting-started/getting-started-docker).
+
+## 4. Generate a machine-to-machine token
+
+Use the confidential `sample-api-m2m` client for service-to-service testing:
 
 ```bash
 curl -X POST http://localhost:8080/realms/aspire-guide/protocol/openid-connect/token \
@@ -29,43 +96,18 @@ curl -X POST http://localhost:8080/realms/aspire-guide/protocol/openid-connect/t
   -d "client_secret=local-dev-secret"
 ```
 
-### Response
-
-```json
-{
-  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cC...",
-  "expires_in": 900,
-  "token_type": "Bearer"
-}
-```
-
-### Using the Token
+Copy the returned `access_token` and call a protected endpoint:
 
 ```bash
-TOKEN="<access_token_from_response>"
-
-curl http://localhost:{api-port}/api/secure/files \
-  -H "Authorization: Bearer $TOKEN"
+curl http://localhost:<api-port>/api/secure/files \
+  -H "Authorization: Bearer <access-token>"
 ```
 
----
+Use client credentials only for non-user workloads. Never use the local client secret in a production environment.
 
-## User Login — Resource Owner Password Flow
+## 5. Generate a development user token
 
-Use this flow for development and test scenarios where a user provides a username and password directly.
-
-### Test Users
-
-| Username | Password | Roles |
-|----------|----------|-------|
-| `dev-user` | `Dev@1234` | `api-reader` |
-| `dev-admin` | `DevAdmin@1234` | `api-reader`, `api-writer` |
-
-### Configuration
-- **Client ID**: `sample-api-ui`
-- **Grant Type**: `password`
-
-### curl Command — dev-user
+For local testing, request a token with the public `sample-api-ui` client. The password grant is enabled only as a development convenience:
 
 ```bash
 curl -X POST http://localhost:8080/realms/aspire-guide/protocol/openid-connect/token \
@@ -77,153 +119,42 @@ curl -X POST http://localhost:8080/realms/aspire-guide/protocol/openid-connect/t
   -d "scope=openid"
 ```
 
-### curl Command — dev-admin (higher privileges)
+Use `dev-admin` to test the additional `api-writer` role:
+
+```text
+Username: dev-admin
+Password: DevAdmin@1234
+```
+
+Test the token and authorization:
 
 ```bash
-curl -X POST http://localhost:8080/realms/aspire-guide/protocol/openid-connect/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=password" \
-  -d "client_id=sample-api-ui" \
-  -d "username=dev-admin" \
-  -d "password=DevAdmin@1234" \
-  -d "scope=openid"
+curl http://localhost:<api-port>/api/secure/whoami \
+  -H "Authorization: Bearer <access-token>"
+
+curl http://localhost:<api-port>/api/secure/files \
+  -H "Authorization: Bearer <access-token>"
 ```
 
-### Response
+## 6. Verify the API authority and audience
 
-```json
-{
-  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "expires_in": 900,
-  "refresh_token": "eyJhbGciOiJSUzI1NiIsInR5cCIsInR5cCI6IkpXVCJ9...",
-  "token_type": "Bearer",
-  "scope": "openid"
-}
-```
+The API validates JWTs from the configured authority. Inspect the token claims with `/api/secure/whoami` and confirm that the issuer, audience, subject, and roles match the expected client and realm.
 
-### Using the Token
+For production, configure an HTTPS authority explicitly and keep HTTPS metadata validation enabled. Follow the [Aspire Keycloak client integration guidance](https://aspire.dev/integrations/security/keycloak/) when using Aspire's Keycloak authentication packages instead of the repository's custom environment-based configuration.
+
+## 7. Move from local Keycloak to Microsoft Entra ID
+
+Provide the production authority and audience through deployment configuration rather than changing endpoint authorization code:
 
 ```bash
-TOKEN="<access_token_from_response>"
-
-# Test the token — returns all claims
-curl http://localhost:{api-port}/api/secure/whoami \
-  -H "Authorization: Bearer $TOKEN"
-
-# Call protected endpoint that requires api-reader role
-curl http://localhost:{api-port}/api/secure/files \
-  -H "Authorization: Bearer $TOKEN"
+Authentication__Authority=https://login.microsoftonline.com/<tenant-id>/v2.0
+Authentication__Audience=api://<client-id>
 ```
 
----
-
-## Debugging Token Content
-
-The `/api/secure/whoami` endpoint echoes all claims in the token, useful for verifying roles and permissions:
-
-```bash
-curl http://localhost:{api-port}/api/secure/whoami \
-  -H "Authorization: Bearer $TOKEN"
-```
-
-Example response:
-```json
-[
-  { "type": "sub", "value": "12345678-1234-1234-1234-123456789012" },
-  { "type": "roles", "value": "api-reader" },
-  { "type": "aud", "value": "sample-api" },
-  { "type": "preferred_username", "value": "dev-user" }
-]
-```
-
----
-
-## Extending Test Users and Clients
-
-The sample users (`dev-user`, `dev-admin`) and clients (`sample-api-ui`, `sample-api-m2m`) are loaded from the local realm configuration file at startup.
-
-### File Location
-```
-infrastructure/AspireGuide.AppHost/Keycloak/realm-export.json
-```
-
-### Adding More Users
-
-Edit `realm-export.json` and add entries to the `users` array:
-
-```json
-{
-  "username": "custom-user",
-  "enabled": true,
-  "emailVerified": true,
-  "email": "custom@local.dev",
-  "requiredActions": [],
-  "credentials": [
-    {
-      "type": "password",
-      "value": "Custom@1234",
-      "temporary": false
-    }
-  ],
-  "realmRoles": [ "api-reader" ]
-}
-```
-
-### Adding More Clients
-
-Edit `realm-export.json` and add entries to the `clients` array:
-
-```json
-{
-  "clientId": "custom-client",
-  "publicClient": false,
-  "clientAuthenticatorType": "client-secret",
-  "secret": "custom-secret-key",
-  "serviceAccountsEnabled": true,
-  "standardFlowEnabled": false,
-  "directAccessGrantsEnabled": false,
-  "protocolMappers": [
-    {
-      "name": "audience-mapper",
-      "protocol": "openid-connect",
-      "protocolMapper": "oidc-audience-mapper",
-      "consentRequired": false,
-      "config": {
-        "included.custom.audience": "sample-api",
-        "access.token.claim": "true",
-        "id.token.claim": "false"
-      }
-    }
-  ]
-}
-```
-
-### Reloading Configuration
-
-After modifying `realm-export.json`:
-
-1. Stop the AppHost
-2. Delete the Keycloak volume to force a fresh import:
-   ```bash
-   docker volume rm keycloak-data
-   ```
-3. Restart the AppHost — Keycloak will reimport the realm with your changes
-
----
-
-## Switching to Microsoft Entra ID
-
-To use Microsoft Entra ID instead of local Keycloak, update the environment variables shown below. In most cases, the application code does not need to change if it already relies on standard JWT bearer authentication.
-
-```bash
-export Authentication__Authority=https://login.microsoftonline.com/{tenantId}/v2.0
-export Authentication__Audience=api://{clientId}
-```
-
-The API-side JWT bearer validation flow remains the same, but token issuance moves from the local Keycloak endpoint to Microsoft Entra ID.
+Use secure deployment configuration, HTTPS, managed identities where applicable, and production identity-provider policies. Do not import the local realm passwords or client secrets into Azure.
 
 ## References
 
-- [Keycloak Documentation](https://www.keycloak.org/documentation)
-- [Aspire Keycloak Integration Guide](https://aspire.dev/integrations/security/keycloak/)
-- [OAuth 2.0 and OpenID Connect](https://oauth.net/2/)
+- [Keycloak integration | Aspire](https://aspire.dev/integrations/security/keycloak/)
+- [Docker - Keycloak](https://www.keycloak.org/getting-started/getting-started-docker)
+- [Keycloak documentation](https://www.keycloak.org/documentation)
