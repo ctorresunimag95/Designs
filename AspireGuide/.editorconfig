@@ -459,7 +459,7 @@ dotnet_diagnostic.IDE0053.severity = none
 # Code quality
 
 # CA1707: Parameter naming
-dotnet_diagnostic.CA1707.severity = warning
+dotnet_diagnostic.CA1707.severity = none
 
 # CA1712: Do not prefix enum values with type name
 dotnet_diagnostic.CA1712.severity = warning
@@ -502,6 +502,9 @@ dotnet_diagnostic.S2971.severity = silent
 
 # Convert to auto property without backing field
 dotnet_diagnostic.S2292.severity = suggestion
+
+# IDE0058: Expression value is never used
+dotnet_diagnostic.IDE0058.severity = none
 
 # Bug which may not be fixed until NET 8
 # https://github.com/dotnet/roslyn-analyzers/issues/6141
