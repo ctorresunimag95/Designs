@@ -1,0 +1,25 @@
+@page "/Error"
+@using Microsoft.AspNetCore.Diagnostics
+@inject IWebHostEnvironment HostEnvironment
+
+<PageTitle>Error</PageTitle>
+
+<h1>Something went wrong</h1>
+<p class="alert err">The Service Bus Explorer could not process the request.</p>
+
+@if (HostEnvironment.IsDevelopment())
+{
+    var exception = HttpContextAccessor.HttpContext?.Features.Get<IExceptionHandlerFeature>()?.Error;
+    if (exception is not null)
+    {
+        <details open>
+            <summary>Exception details</summary>
+            <pre>@exception.ToString()</pre>
+        </details>
+    }
+}
+
+@code {
+    [Inject]
+    private IHttpContextAccessor HttpContextAccessor { get; set; } = default!;
+}
