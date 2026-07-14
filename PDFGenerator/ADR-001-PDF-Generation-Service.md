@@ -41,6 +41,7 @@ A secondary question arises once the centralised service is chosen: **how does t
 
 - Option 1 — Message bus (Azure Service Bus, Redis Streams, RabbitMQ)
 - Option 2 — Content store + lightweight event (Azure Blob Storage + blob-created trigger) ✅
+- Option 3 — Direct-to-Blob upload + blob-created trigger (alternative; not selected)
 
 ---
 
@@ -49,6 +50,8 @@ A secondary question arises once the centralised service is chosen: **how does t
 **Chosen option: Option C — Centralised PDF Generation Service**, because it is the only option that consolidates the IronPDF license to a single deployment, removes engine lock-in from all consumers, and provides idempotency and status tracking across every team without additional per-team work.
 
 **Chosen content transport: Option 2 — Content store + lightweight event**, because PDF generation payloads regularly exceed the message-size limits of mainstream message buses (Azure Service Bus Standard caps at 256 KB; a single medium-resolution logo encoded as base64 can exceed this on its own). Passing only a `jobId` in the trigger event and reading the full payload from blob storage avoids this ceiling entirely.
+
+**Option 3 — Direct-to-Blob upload + blob-created trigger** remains a valid alternative for workloads with frequent, very large submissions or high concurrent upload volume. The caller first requests a short-lived upload signature from the API, then uploads the content directly to the job-specific blob path. The resulting blob-created event starts the existing Worker flow; no completion endpoint is required. It is not selected for v1 because Option 2 provides a simpler single-request caller contract.
 
 All new PDF generation work must go through this service. Existing services with embedded IronPDF are candidates for migration in a follow-on phase (not in scope for v1).
 
@@ -136,6 +139,19 @@ The decision is being followed if:
 - Good, because the content blob is ephemeral: the Worker deletes it immediately after reading, so there is no long-lived storage cost.
 - Neutral, because the Worker must make a separate read call to `IContentStore` rather than consuming the payload inline from the event — this is one extra I/O hop that is negligible in practice.
 
+### Option 3 — Direct-to-Blob upload + blob-created trigger (alternative; not selected)
+
+`Azure Blob Storage — API creates an upload session and returns a short-lived scoped upload signature; caller uploads the content directly to Blob Storage; the blob-created event triggers the Worker`
+
+- Good, because the API host does not receive, deserialize, or upload large content payloads, reducing API memory, CPU, and inbound-bandwidth contention when several large requests arrive concurrently.
+- Good, because Blob Storage can handle the large uploads directly while the API handles only the small upload-session request.
+- Good, because the Worker still receives only a lightweight `jobId` trigger and reads the content through `IContentStore`; the Worker contract is unchanged.
+- Good, because the API can issue a short-lived, scoped upload URL for one job-specific blob path, limiting upload permissions and lifetime.
+- Good, because there is no caller completion endpoint or extra API round trip after the upload; a successfully committed Blob Storage upload emits the event that starts processing.
+- Bad, because callers must implement a two-call protocol overall: request an upload session from the API, then upload content to Blob Storage using the returned signature.
+- Bad, because incomplete uploads and abandoned `AwaitingUpload` jobs require expiry, cleanup, and operational monitoring.
+- Bad, because the Worker must atomically claim an `AwaitingUpload` job before processing and tolerate duplicate blob-created events. It must validate that the event blob path belongs to the job before transitioning it to `Processing`.
+
 ---
 
 ## More Information
@@ -197,6 +213,33 @@ flowchart LR
     ContentStore -- "blob-created event / trigger" --> Process
     Process -- "read content blob" --> ContentStore
     Process -- "delete content blob" --> ContentStore
+    Process -- "status writes" --> JobStore
+    Process --> Renderer
+    Process -- "POST PDF / error" --> Caller
+```
+
+#### Alternative: direct-to-Blob upload
+
+```mermaid
+flowchart LR
+    Caller([Caller])
+    subgraph API[API host]
+      Create[Create upload session]
+    end
+    JobStore[(IJobStore<br/>Azure Table)]
+    ContentStore[(IContentStore<br/>Azure Blob Storage)]
+    subgraph Worker[Worker host]
+      Process[ProcessDocumentJob]
+      Renderer[IDocumentRenderer<br/>IronPDF]
+    end
+
+    Caller -- "POST /document/uploads<br/>metadata + idempotentKey" --> Create
+    Create -- "create AwaitingUpload job" --> JobStore
+    Create -- "201 + jobId + short-lived<br/>scoped upload URL" --> Caller
+    Caller -- "upload large content directly" --> ContentStore
+  ContentStore -- "blob-created event (jobId)" --> Process
+  Process -- "validate path; atomically claim<br/>AwaitingUpload → Processing" --> JobStore
+    Process -- "read and delete content" --> ContentStore
     Process -- "status writes" --> JobStore
     Process --> Renderer
     Process -- "POST PDF / error" --> Caller
