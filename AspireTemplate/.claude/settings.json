@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"AspireTemplate\")",
+      "Bash(nohup dotnet run --launch-profile http)",
+      "Bash(powershell -Command \"Get-Process -Name '*AspireTemplate*' -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\" | Format-Table Name, @{Label=\"Type\";Expression={if\\($_.PSIsContainer\\){\"Folder\"}else{\"File\"}}} -AutoSize)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\" -Recurse -Directory | Select-Object @{Label=\"Path\";Expression={$_.FullName.Substring\\(59\\)}} | Sort-Object Path)",
+      "Bash(dotnet run *)",
+      "Bash(dotnet test *)",
+      "PowerShell(Get-ChildItem -Path \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Templates\\\\\" -Recurse | Select-Object -Property FullName, @{Name='Type';Expression={if\\($_.PSIsContainer\\) {'DIR'} else {'FILE'}}} | Sort-Object FullName)",
+      "Bash(sed -i 's/^internal sealed record ResourceDefinition/public sealed record ResourceDefinition/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\ResourceDefinition.cs\")",
+      "Bash(sed -i 's/^internal sealed record CompanionFile/public sealed record CompanionFile/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\CompanionFile.cs\")",
+      "Bash(sed -i 's/^internal sealed record PackageRequirement/public sealed record PackageRequirement/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\PackageRequirement.cs\")",
+      "Bash(sed -i 's/^internal static class ResourceCatalog/public static class ResourceCatalog/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\ResourceCatalog.cs\")",
+      "Bash(sed -i 's/^internal sealed record ProjectRequirement/public sealed record ProjectRequirement/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\ProjectRequirement.cs\")",
+      "Bash(sed -i 's/^internal enum ResourceType/public enum ResourceType/' \"c:\\\\Work\\\\my repos\\\\designs\\\\AspireTemplate\\\\infrastructure\\\\AspireTemplate.ResourceCli\\\\Catalog\\\\ResourceType.cs\")",
+      "Bash(grep -v \"^$\")"
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+// <AspireTemplate resource="appconfiguration">
+# region App Configuration
+
+var appConfiguration = builder.AddAzureAppConfiguration("appConfiguration")
+    .RunAsEmulator(emulator =>
+    {
+        emulator
+            .WithEnvironment("AZURE_APP_CONFIGURATION_EMULATOR_AUTHENTICATION_ENABLED", "false")
+            .WithHostPort(28000)
+            .WithLifetime(ContainerLifetime.Persistent)
+            .WithDataVolume("appconfig-data");
+    });
+
+#endregion
+// </AspireTemplate>
