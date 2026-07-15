@@ -60,34 +60,107 @@ AspireTemplate init --directory src/MyAppHost --solution MyApp.sln --yes
 
 ## Installation
 
-### As a local tool (recommended)
+Since AspireTemplate.ResourceCli is not published to NuGet.org, you must build the NuGet package first.
+
+### Build the NuGet package
 
 ```bash
-dotnet new tool-manifest   # if not already present
-dotnet tool install --local AspireTemplate.ResourceCli
+cd infrastructure/AspireTemplate.ResourceCli
+dotnet pack -o ./nupkg
+```
+
+This creates a `.nupkg` file in the `./nupkg` directory. Use the path to this package when installing.
+
+---
+
+Choose the installation approach that fits your workflow:
+
+### Local tool installation (recommended for teams)
+
+Install the tool in your repository only. The tool is scoped to this project and managed through version control.
+
+**Benefits:**
+- All team members use the same version (specified in `.dotnet/tools/dotnet-tools.json`)
+- No global system clutter
+- Each project can use different tool versions
+- Easy to enforce consistency across the team
+
+**Installation:**
+
+```bash
+# Step 1: Create a tool manifest (run once per repository)
+dotnet new tool-manifest
+
+# Step 2: Install AspireTemplate.ResourceCli locally from the nupkg
+dotnet tool install --local AspireTemplate.ResourceCli --add-source ./infrastructure/AspireTemplate.ResourceCli/nupkg
+
+# Step 3: Verify installation
 AspireTemplate list
 ```
 
-### As a global tool
+The tool is now installed in `.dotnet/tools/` within your repository. Commit `.dotnet/tools/dotnet-tools.json` to version control.
+
+**For team members:**
 
 ```bash
-dotnet tool install --global AspireTemplate.ResourceCli
+# Restore all tools from the manifest
+dotnet tool restore
+
+# Use the tool
 AspireTemplate list
 ```
 
-### Update
+**Update:**
 
 ```bash
 dotnet tool update --local AspireTemplate.ResourceCli
-# or
-dotnet tool update --global AspireTemplate.ResourceCli
 ```
 
-### Uninstall
+**Uninstall:**
 
 ```bash
 dotnet tool uninstall --local AspireTemplate.ResourceCli
 ```
+
+### Global tool installation (for personal use)
+
+Install the tool on your machine. It works from any directory.
+
+**Benefits:**
+- Available across all projects on your machine
+- No per-project configuration needed
+- Quick one-time setup
+
+**Installation:**
+
+```bash
+# Install globally from the nupkg
+dotnet tool install --global AspireTemplate.ResourceCli --add-source ./infrastructure/AspireTemplate.ResourceCli/nupkg
+
+# Verify installation
+AspireTemplate list
+```
+
+The tool is installed in your `$PATH` and available from any directory.
+
+**Update:**
+
+```bash
+dotnet tool update --global AspireTemplate.ResourceCli
+```
+
+**Uninstall:**
+
+```bash
+dotnet tool uninstall --global AspireTemplate.ResourceCli
+```
+
+**Troubleshooting:**
+
+If you get "command not found" after installation, add the global tools directory to your `$PATH`:
+
+- **Linux/macOS:** `~/.dotnet/tools`
+- **Windows:** `%USERPROFILE%\.dotnet\tools`
 
 ## Local development / pack
 

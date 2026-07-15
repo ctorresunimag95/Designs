@@ -50,6 +50,71 @@ Open the Aspire dashboard URL printed in the terminal. Use the dashboard to moni
 
 The local AppHost uses persistent Docker volumes for SQL Server, Azurite, Keycloak, and App Configuration. Remove the relevant volume only when you need to reset emulator data, because doing so permanently deletes that local state.
 
+## Integration Options
+
+New developers can use AspireTemplate in three ways:
+
+### Option 1: Clone and Run Independently
+
+Clone this repository and run it as a standalone reference application. This approach is best for learning and understanding how to structure an Aspire application.
+
+```bash
+git clone https://github.com/your-org/AspireTemplate.git
+cd AspireTemplate
+dotnet run --project infrastructure/AspireTemplate.AppHost
+```
+
+**When to use:**
+- You want a complete working example to study and learn from
+- You need to understand Aspire patterns before implementing in your own project
+- If you're working in a dev container, run AspireTemplate inside your dev container alongside your project, or ensure both are in the same dev container to connect between them
+- Connection strings and service endpoints are available in the Aspire dashboard for integration into your applications
+
+### Option 2: Copy Resources into Your AppHost
+
+Extract the specific resources you need from this repository's AppHost and add them to your own application's AppHost. This is the most flexible approach when you want to use only certain resources without the full template.
+
+**Steps:**
+1. Open `infrastructure/AspireTemplate.AppHost/AppHost.cs` in this repository
+2. Locate the resource definitions you need (e.g., Service Bus, Storage, SQL Server)
+3. Copy the relevant code blocks into your AppHost's `Program.cs`
+4. Reference the [configuration guides](#documentation) for detailed setup of each resource
+5. Install any required NuGet packages in your projects
+
+**When to use:**
+- You have an existing AppHost and want to add specific resources
+- You need to customize resource configuration for your project
+- You prefer manual control over your AppHost setup
+
+### Option 3: Use the AspireTemplate CLI Tool
+
+Install the `AspireTemplate.ResourceCli` tool to interactively scaffold and add pre-configured resources to a new or existing AppHost. This approach automates code generation and dependency management.
+
+**Quick start:**
+
+```bash
+# Build the NuGet package
+cd infrastructure/AspireTemplate.ResourceCli
+dotnet pack -o ./nupkg
+
+# Install the tool locally (recommended for teams)
+dotnet new tool-manifest
+dotnet tool install --local AspireTemplate.ResourceCli --add-source ./infrastructure/AspireTemplate.ResourceCli/nupkg
+
+# Use the tool
+AspireTemplate list        # View available resources
+AspireTemplate add         # Interactively add resources
+```
+
+For detailed installation and usage instructions, see the [ResourceCli README](infrastructure/AspireTemplate.ResourceCli/README.md).
+
+**When to use:**
+- Starting a new AppHost from scratch
+- Quickly adding multiple pre-configured resources
+- Teams that want consistency across projects
+
+---
+
 ## Getting Started
 
 ### AppHost configuration
