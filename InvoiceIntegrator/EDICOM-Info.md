@@ -78,93 +78,106 @@ Idempotency-Key: {invoice-number-or-uuid}
 
 ## JSON Payload Contract (AE PINT mandatory fields)
 
-The UAE mandate is **AE PINT** (Peppol PINT adapted for UAE/FTA). The fields below map to UBL 2.1 BT/BG elements. EDICOM likely accepts a JSON representation which they convert to UBL — the field names in their actual contract may differ (camelCase, snake_case, or proprietary wrapper). ⚠️
+The UAE mandate is **AE PINT** (Peppol PINT adapted for UAE/FTA). The fields below are derived from the official UAE Electronic Invoice Mandatory Fields spec (MoF v1.0, Feb 2026) and map to UBL 2.1 BT/BG elements. EDICOM likely accepts a JSON representation which they convert to UBL — the field names in their actual contract may differ (camelCase, snake_case, or proprietary wrapper). ⚠️
 
 ```json
 {
-  "invoiceNumber": "INV-2025-00123",
-  "invoiceUuid": "550e8400-e29b-41d4-a716-446655440000",
-  "issueDate": "2025-11-15",
-  "dueDate": "2025-12-15",
-  "invoiceTypeCode": "380",
-  "currencyCode": "AED",
-  "buyerReference": "PO-98765",
+  // ── Invoice Details (MoF §4.1 fields 1–9) ──────────────────────────────
+  "invoiceNumber": "INV-2025-00123",          // #1  Invoice number
+  "issueDate": "2025-11-15",                  // #2  Invoice date
+  "invoiceTypeCode": "380",                   // #3  380 = Invoice, 381 = Credit Note
+  "currencyCode": "AED",                      // #4  ISO 4217
+  "invoiceTransactionTypeCode": "00000000",   // #5  8-flag bitmask: FreeTradeZone/DeemedSupply/MarginScheme/Summary/ContinuousSupply/DisclosedAgent/eCommerce/Exports
+  "dueDate": "2025-12-15",                    // #6  Payment due date
+  "businessProcessType": "urn:peppol:bis:billing",           // #7  Business process type / BT-23
+  "specificationIdentifier": "urn:peppol:pint:billing-1@ae-1", // #8  Specification Identifier / BT-24
+  "paymentMeansCode": "30",                   // #9  UNCL4461: 30 = Credit transfer
 
+  // ── Seller Details (MoF §4.1 fields 10–20) ─────────────────────────────
   "seller": {
-    "name": "Acme FZE",
-    "taxRegistrationNumber": "100123456700003",
-    "address": {
-      "street": "Office 101, Building A",
-      "city": "Dubai",
-      "postalCode": "00000",
-      "countryCode": "AE"
+    "name": "Acme FZE",                       // #10 Full legal name
+    "electronicDelivery": {                   // #11–12 Electronic delivery address
+      "address": "1001234567",                // #11 Seller TIN (first 10 digits of TRN)
+      "identifier": "0235"                    // #12 Fixed scheme code for UAE businesses
+    },
+    "legalInfo": {                            // #13–14 Legal registration document
+      "identifier": "TL-DXB-123456",          // #13 Trade license / EID / passport number
+      "registrationIdentifierType": "TL"      // #14 TL / EID / PAS / CD
+    },
+    "taxInfo": {                              // #15–16 Tax registration
+      "identifier": "100123456700003",        // #15 TRN (15 digits); use TIN if no TRN
+      "scheme": "VAT"                         // #16 Default VAT
+    },
+    "address": {                              // #17–20
+      "line1": "Office 101, Building A",      // #17
+      "city": "Dubai",                        // #18
+      "subdivision": "Dubai",                 // #19 Emirate / region
+      "countryCode": "AE"                     // #20
     }
   },
 
+  // ── Buyer Details (MoF §4.1 fields 21–29) ──────────────────────────────
   "buyer": {
-    "name": "Buyer Corp LLC",
-    "taxRegistrationNumber": "100987654300003",
-    "peppolId": "0088:buyer-gln-here",
-    "address": {
-      "street": "Unit 5, Free Zone",
-      "city": "Abu Dhabi",
-      "postalCode": "00000",
-      "countryCode": "AE"
+    "name": "Buyer Corp LLC",                 // #21 Full legal name
+    "electronicDelivery": {                   // #22–23 Electronic delivery address
+      "address": "1009876543",                // #22 Buyer TIN — delivery endpoint
+      "identifier": "0235"                    // #23 Fixed scheme code for UAE businesses
+    },
+    "taxInfo": {                              // #24–25 Tax registration
+      "identifier": "100987654300003",        // #24 Buyer TRN (if VAT-registered)
+      "scheme": "VAT"                         // #25 Default VAT
+    },
+    "address": {                              // #26–29
+      "line1": "Unit 5, Free Zone",           // #26
+      "city": "Abu Dhabi",                    // #27
+      "subdivision": "Abu Dhabi",             // #28 Emirate / region
+      "countryCode": "AE"                     // #29
     }
   },
 
+  // ── Tax Breakdown (MoF §4.1 fields 35–38) ──────────────────────────────
+  "taxBreakdown": {
+    "taxableAmount": 5000.0,                  // #35 Sum of taxable amounts for this category
+    "taxAmount": 250.0,                       // #36 Tax amount for this category
+    "taxClass": {                             // #37–38 Tax category classification
+      "code": "S",                            // #37 S = Standard, Z = Zero-rated, E = Exempt
+      "rate": 5.0                             // #38 Percentage (UAE standard = 5%)
+    }
+  },
+
+  // ── Invoice Lines (MoF §4.1 fields 39–51) ──────────────────────────────
   "lines": [
     {
-      "lineId": "1",
-      "description": "Consulting services",
-      "quantity": 10,
-      "unitCode": "HUR",
-      "unitPrice": 500.0,
-      "lineNetAmount": 5000.0,
-      "vatRate": 5.0,
-      "vatCategoryCode": "S"
+      "lineIdentifier": "1",                  // #39
+      "invoicedQuantity": 10,                 // #40
+      "unitOfMeasureCode": "HUR",             // #41 UN/ECE Rec 20 unit code
+      "lineNetAmount": 5000.0,                // #42 Line total before tax
+      "unitPrice": {                          // #43–45 Item pricing
+        "net": 500.0,                         // #43 Unit price after discount
+        "gross": 500.0,                       // #44 Unit price before discount
+        "baseQuantity": 1                     // #45 Units the price applies to
+      },
+      "taxClass": {                           // #46–47 Line-level tax classification
+        "code": "S",                          // #46 S / Z / E
+        "rate": 5.0                           // #47 Percentage
+      },
+      "vatLineAmountAED": 250.0,              // #48 VAT amount for this line in AED
+      "lineAmountAED": 5250.0,                // #49 Total payable for this line in AED
+      "itemName": "Consulting services",      // #50
+      "itemDescription": "Monthly consulting engagement" // #51
     }
   ],
 
-  "taxTotal": {
-    "taxAmount": 250.0,
-    "taxableAmount": 5000.0,
-    "vatCategoryCode": "S",
-    "vatRate": 5.0
-  },
-
+  // ── Document Totals (MoF §4.1 fields 30–34) ────────────────────────────
   "totals": {
-    "lineNetAmount": 5000.0,
-    "taxExclusiveAmount": 5000.0,
-    "taxInclusiveAmount": 5250.0,
-    "payableAmount": 5250.0
-  },
-
-  "paymentMeans": {
-    "code": "30",
-    "paymentId": "INV-2025-00123"
+    "sumOfLineNetAmounts": 5000.0,            // #30 Sum of all line net amounts
+    "invoiceTotalWithoutTax": 5000.0,         // #31
+    "invoiceTotalTaxAmount": 250.0,           // #32
+    "invoiceTotalWithTax": 5250.0,            // #33
+    "amountDueForPayment": 5250.0             // #34
   }
 }
 ```
-
-### Field Reference (UBL BT mapping)
-
-| JSON field                     | UBL BT | Notes                                                                |
-| ------------------------------ | ------ | -------------------------------------------------------------------- |
-| `invoiceNumber`                | BT-1   | Sequential, never reused                                             |
-| `invoiceUuid`                  | —      | UAE-specific; generated by sender                                    |
-| `issueDate`                    | BT-2   | ISO-8601 date                                                        |
-| `dueDate`                      | BT-9   |                                                                      |
-| `invoiceTypeCode`              | BT-3   | 380 = Invoice, 381 = Credit Note                                     |
-| `currencyCode`                 | BT-5   | ISO 4217 (AED)                                                       |
-| `buyerReference`               | BT-10  | Buyer's PO or reference                                              |
-| `seller.taxRegistrationNumber` | BT-31  | UAE TRN, 15 digits, mandatory                                        |
-| `buyer.peppolId`               | —      | Peppol participant ID for routing; format `0088:{GLN}` or UAE scheme |
-| `lines[].unitCode`             | BT-130 | UN/ECE Rec 20 unit code                                              |
-| `lines[].vatCategoryCode`      | BT-151 | S=Standard, Z=Zero-rated, E=Exempt                                   |
-| `taxTotal.vatRate`             | BT-152 | UAE standard = 5%                                                    |
-| `totals.payableAmount`         | BT-115 | Final amount due                                                     |
-| `paymentMeans.code`            | BT-81  | UNCL4461: 30=Credit transfer                                         |
 
 ---
 
@@ -193,19 +206,6 @@ Response:
 **Status values:** `PENDING` → `ACKNOWLEDGED` (terminal ✅) | `REJECTED` (terminal ❌)
 
 On `REJECTED`, `errors[]` contains AE PINT validation codes (e.g. `PEPPOL-EN16931-R001`).
-
----
-
-## AE PINT Business Rules (Key)
-
-| Rule              | Detail                                                                           |
-| ----------------- | -------------------------------------------------------------------------------- |
-| VAT rate          | Standard 5%; zero-rated and exempt also valid                                    |
-| TRN               | 15-digit UAE Tax Registration Number — mandatory for seller                      |
-| Buyer Peppol ID   | Required for EDICOM to route via Peppol SMP; ⚠️ confirm if EDICOM can look it up |
-| Invoice UUID      | Globally unique per invoice — generated by your system                           |
-| Sequential number | Must never be reused or recycled across the fiscal year                          |
-| Retention         | 7 years (drives the audit table design in ADR-001)                               |
 
 ---
 
