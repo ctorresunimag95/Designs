@@ -109,6 +109,90 @@ flowchart LR
 
 ---
 
+### Option A4 — Source-Notified: Source Pushes to Queue → Invoice Processor → EDICOM
+
+The source system notifies us when an invoice is ready by placing it on a queue directly — no polling, no timer. The Invoice Processor picks it up, writes it to the audit store with `Status = Pending`, then submits to EDICOM.
+
+Two sub-options depending on how EDICOM responds:
+
+---
+
+#### Option A4a — Synchronous EDICOM Response
+
+EDICOM returns the final outcome (`ACKNOWLEDGED` / `REJECTED`) on the same HTTP call. The processor writes the terminal status immediately.
+
+```mermaid
+flowchart LR
+    Source([Source System])
+
+    subgraph Processor[Invoice Processor\nscale horizontally]
+        Consume[Consume InvoiceReady]
+        Store[Write to audit store\nStatus = Pending]
+        Transform[Map → AE PINT]
+        Submit[Submit to EDICOM]
+        Record[Record outcome\nAcknowledged / Failed]
+    end
+
+    Inbound([Inbound Queue\nAzure Service Bus /\nRabbitMQ])
+    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
+    Edicom{{EDICOM ASP\nPeppol Access Point}}
+
+    Source -- push InvoiceReady --> Inbound
+    Inbound -- message --> Consume
+    Consume -- insert Pending --> Track
+    Store --> Transform
+    Submit -- POST invoice --> Edicom
+    Edicom -- Acknowledged / Rejected --> Submit
+    Record -- update terminal status --> Track
+```
+
+> **No backpressure from a poller** — the source controls the publish rate. If the source floods the queue the same processor scale-out applies. The `UNIQUE(InvoiceNumber)` constraint on the audit store prevents duplicates if the source sends the same invoice twice.
+
+---
+
+#### Option A4b — Asynchronous EDICOM Response (with Status Reconciler)
+
+EDICOM returns only a `transactionId` on the POST. A separate reconciler polls the status endpoint until the invoice reaches a terminal state.
+
+```mermaid
+flowchart LR
+    Source([Source System])
+    StatusSched([Status Poll Cron])
+
+    subgraph Processor[Invoice Processor\nscale horizontally]
+        Consume[Consume InvoiceReady]
+        Store[Write to audit store\nStatus = Pending]
+        Transform[Map → AE PINT]
+        Submit[Submit to EDICOM]
+        RecordTxn[Record transactionId\nStatus = WaitingConfirmation]
+    end
+
+    subgraph Reconciler[Status Reconciler]
+        PollStatus[Read WaitingConfirmation rows\nGET EDICOM status per transactionId]
+        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
+    end
+
+    Inbound([Inbound Queue\nAzure Service Bus /\nRabbitMQ])
+    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
+    Edicom{{EDICOM ASP\nPeppol Access Point}}
+
+    Source -- push InvoiceReady --> Inbound
+    Inbound -- message --> Consume
+    Consume -- insert Pending --> Track
+    Store --> Transform
+    Submit -- POST invoice --> Edicom
+    Edicom -- transactionId --> RecordTxn
+    RecordTxn -- write WaitingConfirmation --> Track
+    StatusSched -- trigger --> Reconciler
+    PollStatus -- read rows --> Track
+    PollStatus -- GET status --> Edicom
+    RecordFinal -- update terminal status --> Track
+```
+
+> **Choose A4b over A4a** when EDICOM's POST only confirms receipt (not final acceptance) — see [EDICOM-Info.md](EDICOM-Info.md) open question #11. If confirmed that the POST returns the final outcome synchronously, A4a is sufficient and simpler.
+
+---
+
 ## Scenario B — No Existing Data Source (Invoice Hub)
 
 ### Option B1 — Invoice Hub with Push Ingest + EDICOM Publisher
@@ -214,10 +298,12 @@ The tradeoff is operational complexity: you're running push adapters, pull polle
 
 ## Option Comparison Matrix
 
-| Option                                | Source assumption    | Event-driven? | Complexity  | Scales horizontally? | Best fit                                    |
-| ------------------------------------- | -------------------- | :-----------: | :---------: | :------------------: | ------------------------------------------- |
-| **A1** Direct Extractor               | Single source DB     |  No (batch)   |     Low     |          No          | Simple, fastest to ship                     |
-| **A2** Extractor + Bus + Processor    | Single source DB     |      Yes      |   Medium    |   Yes (processor)    | Medium volume, clean separation of concerns |
-| **A3** Extractor + Bus + Async Status | Single source DB     |      Yes      | Medium-High |         Yes          | Async EDICOM confirmation is critical       |
-| **B1** Invoice Hub (push)             | None / multiple push |    Partial    |   Medium    |         Yes          | Greenfield, all sources can push            |
-| **B2** Invoice Hub (push + pull)      | None / mixed         |      Yes      |    High     |         Yes          | Heterogeneous landscape with legacy systems |
+| Option                                          | Source assumption          | Event-driven? | Complexity  | Scales horizontally? | Best fit                                                  |
+| ----------------------------------------------- | -------------------------- | :-----------: | :---------: | :------------------: | --------------------------------------------------------- |
+| **A1** Direct Extractor                         | Single source DB           |  No (batch)   |     Low     |          No          | Simple, fastest to ship                                   |
+| **A2** Extractor + Bus + Processor              | Single source DB           |      Yes      |   Medium    |   Yes (processor)    | Medium volume, clean separation of concerns               |
+| **A3** Extractor + Bus + Async Status           | Single source DB           |      Yes      | Medium-High |         Yes          | Async EDICOM confirmation is critical                     |
+| **A4a** Source-notified + Sync EDICOM           | Source pushes to queue     |      Yes      |   Medium    |   Yes (processor)    | Source can notify; EDICOM confirms synchronously on POST  |
+| **A4b** Source-notified + Async Status          | Source pushes to queue     |      Yes      | Medium-High |         Yes          | Source can notify; EDICOM POST is receipt-only, not final |
+| **B1** Invoice Hub (push)                       | None / multiple push       |    Partial    |   Medium    |         Yes          | Greenfield, all sources can push                          |
+| **B2** Invoice Hub (push + pull)                | None / mixed               |      Yes      |    High     |         Yes          | Heterogeneous landscape with legacy systems               |
