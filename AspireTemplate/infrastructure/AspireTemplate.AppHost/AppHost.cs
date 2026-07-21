@@ -154,8 +154,8 @@ var migrations = builder.AddProject<Projects.AspireTemplate_MigrationService>("m
 
 # region Identity
 
-// Keycloak runs as a local container that mimics Azure Active Directory using the OpenID Connect protocol.
-// It is pre-configured with the aspire-guide realm (Keycloak/realm-export.json) which includes:
+// ── AUTH OPTION A: Keycloak (full OpenID Connect, recommended for production parity) ─────────────────
+// Keycloak runs as a local container pre-configured with the aspire-guide realm (Keycloak/realm-export.json):
 //   - sample-api-ui  : public client for interactive user login (Auth Code + PKCE)
 //   - sample-api-m2m : confidential client for service-to-service calls (Client Credentials)
 //   - dev-user / dev-admin test users with api-reader and api-writer realm roles
@@ -164,8 +164,15 @@ var migrations = builder.AddProject<Projects.AspireTemplate_MigrationService>("m
 // To swap to real Azure AD in production, set these two environment variables — no code changes needed:
 //   Authentication__Authority = https://login.microsoftonline.com/{tenantId}/v2.0
 //   Authentication__Audience  = api://{clientId}
+//
+// To use Keycloak: uncomment the line below and the two lines in the Sample Api region (.WaitFor / .WithKeycloakAuthentication).
+//
+// var keycloak = builder.AddLocalKeycloak();
 
-var keycloak = builder.AddLocalKeycloak();
+// ── AUTH OPTION B: dotnet user-jwts (no Docker, instant startup) ──────────────────────────────────────
+// Uses the built-in dotnet user-jwts tool to issue signed JWTs locally, with no container needed.
+// Click the "Generate Dev Token" button on the sample-api resource in the Aspire dashboard to get a token
+// on demand. See docs/UserJwts_Token_Generation_Guide.md for details.
 
 #endregion
 
@@ -191,9 +198,11 @@ var api = builder.AddProject<Projects.AspireTemplate_SampleApi>("sample-api")
     .WithReference(blobs, connectionName: "AzureBlobStorage")
     .WithReference(db, "Database")
     .WaitForCompletion(migrations)
-    .WaitFor(keycloak)
-    .WithKeycloakAuthentication(keycloak)
-    .WithReference(appConfiguration)    .WaitFor(appConfiguration);
+    .WithUserJwtCommands()               // Option B: on-demand token generation from the Aspire dashboard
+    // .WaitFor(keycloak)               // Option A: uncomment together with var keycloak above
+    // .WithKeycloakAuthentication(keycloak) // Option A: uncomment together with var keycloak above
+    .WithReference(appConfiguration)
+    .WaitFor(appConfiguration);
 
 if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.ValueExpression))
 {
@@ -206,11 +215,11 @@ if (keyVaultUrl is not null && !string.IsNullOrWhiteSpace(keyVaultUrl.Resource.V
 
 topic.AddServiceBusSubscription("sample-function-subscription");
 
-var function = builder.AddAzureFunctionsProject<Projects.AspireTemplate_SampleFunction>("sample-function")
-    .WithHostStorage(storage)
-    .WaitFor(serviceBus)
-    .WithEnvironment("SERVICE_BUS", serviceBus)
-    .WithHttpEndpoint(port: 7184, targetPort: 7071, name: "http", isProxied: true);
+// var function = builder.AddAzureFunctionsProject<Projects.AspireTemplate_SampleFunction>("sample-function")
+//     .WithHostStorage(storage)
+//     .WaitFor(serviceBus)
+//     .WithEnvironment("SERVICE_BUS", serviceBus)
+//     .WithHttpEndpoint(port: 7184, targetPort: 7071, name: "http", isProxied: true);
 
 #endregion
 

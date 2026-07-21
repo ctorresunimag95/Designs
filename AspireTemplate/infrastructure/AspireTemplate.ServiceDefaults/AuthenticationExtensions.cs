@@ -1,45 +1,56 @@
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.IdentityModel.Tokens;
 
 namespace Microsoft.Extensions.Hosting;
 
 public static class AuthenticationExtensions
 {
     /// <summary>
-    /// Registers JWT Bearer authentication configured from Authentication:Authority and Authentication:Audience.
-    /// Silently skips registration when Authority is not configured (e.g. standalone test runs).
+    /// Registers JWT Bearer authentication. Supports two local dev providers — only the config differs:
     ///
-    /// Works with both Keycloak (local) and Azure AD (production) — only the config values differ:
-    ///   Local Keycloak : Authority = http://localhost:8080/realms/aspire-guide  | Audience = sample-api
-    ///   Azure AD       : Authority = https://login.microsoftonline.com/{tid}/v2.0 | Audience = api://{clientId}
+    ///   Keycloak (Option A) — set Authentication:Authority (injected by AppHost via WithKeycloakAuthentication):
+    ///     Local  : http://localhost:8080/realms/aspire-guide  | Audience = sample-api
+    ///     Azure AD: https://login.microsoftonline.com/{tid}/v2.0 | Audience = api://{clientId}
+    ///
+    ///   dotnet user-jwts (Option B) — no Authority needed; run "Generate Dev Token" in the Aspire dashboard.
+    ///     The tool writes Authentication:Schemes:Bearer:ValidIssuer into appsettings.Development.json
+    ///     and the JwtBearer middleware picks it up automatically.
+    ///
+    /// Silently skips registration when neither provider is configured (e.g. standalone test runs).
     /// </summary>
     public static TBuilder AddApiAuthentication<TBuilder>(this TBuilder builder)
         where TBuilder : IHostApplicationBuilder
     {
         var authority = builder.Configuration["Authentication:Authority"];
-        var audience = builder.Configuration["Authentication:Audience"] ?? "sample-api";
+        var validIssuer = builder.Configuration["Authentication:Schemes:Bearer:ValidIssuer"];
 
-        if (string.IsNullOrWhiteSpace(authority))
+        if (string.IsNullOrWhiteSpace(authority) && string.IsNullOrWhiteSpace(validIssuer))
             return builder;
 
         builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             .AddJwtBearer(options =>
             {
-                options.Authority = authority;
-                options.Audience = audience;
-                options.MapInboundClaims = false;
-
-                // Keycloak runs locally over plain HTTP; Azure AD is always HTTPS.
-                // Deriving the flag from the URL prefix avoids a separate config switch.
-                options.RequireHttpsMetadata = !authority.StartsWith("http://", StringComparison.OrdinalIgnoreCase);
-
-                options.TokenValidationParameters = new TokenValidationParameters
+                if (!string.IsNullOrWhiteSpace(authority))
                 {
-                    ValidateAudience = true,
-                    RoleClaimType = "roles",
-                };
+                    // Option A: Keycloak / Azure AD — OIDC discovery from Authority endpoint.
+                    // Keycloak runs locally over plain HTTP; Azure AD is always HTTPS.
+                    options.Authority = authority;
+                    options.Audience = builder.Configuration["Authentication:Audience"] ?? "sample-api";
+                    options.RequireHttpsMetadata = !authority.StartsWith("http://", StringComparison.OrdinalIgnoreCase);
+
+                    // appsettings.Development.json pre-populates ValidIssuer for Option B.
+                    // Clear it here so Keycloak OIDC discovery is the sole issuer authority
+                    // and user-jwts tokens cannot be accepted in this mode.
+                    options.TokenValidationParameters.ValidIssuer = null;
+                    options.TokenValidationParameters.ValidIssuers = null;
+                }
+                // Option B: dotnet user-jwts — no Authority; JwtBearer reads ValidIssuer +
+                // ValidAudiences from Authentication:Schemes:Bearer (appsettings.Development.json).
+
+                options.MapInboundClaims = false;
+                // Mutate rather than replace so the config-bound values from Option B are preserved.
+                options.TokenValidationParameters.RoleClaimType = "roles";
             });
 
         builder.Services.AddAuthorization(options =>
