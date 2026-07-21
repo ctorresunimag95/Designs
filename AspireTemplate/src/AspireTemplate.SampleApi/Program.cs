@@ -79,6 +79,15 @@ app.MapGet("/api/secure/whoami", (HttpContext context) =>
     return Results.Ok(claims);
 }).RequireAuthorization();
 
+// M2M endpoint — requires api-reader app role (Entra client credentials / user-jwts M2M token)
+app.MapGet("/api/secure/m2m", (HttpContext context) =>
+{
+    var clientId = context.User.FindFirst("client_id")?.Value;
+    var roles = context.User.Claims.Where(c => c.Type == "roles").Select(c => c.Value);
+    var scope = context.User.FindFirst("scope")?.Value;
+    return Results.Ok(new { ClientId = clientId, Roles = roles, Scope = scope });
+}).RequireAuthorization("ApiReader");
+
 app.MapGet("/api/flag", (IFeatureManager featureManager) =>
 {
     var isEnabled = featureManager.IsEnabledAsync("Beta");

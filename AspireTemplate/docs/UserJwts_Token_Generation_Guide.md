@@ -31,7 +31,7 @@ var api = builder.AddProject<...>("sample-api")
 
 No other code changes are needed. The API's `AddApiAuthentication()` in ServiceDefaults detects the user-jwts configuration automatically.
 
-## 3. Generate a token on demand (Aspire dashboard)
+## 3. Generate a user token on demand (Aspire dashboard)
 
 1. Start the AppHost:
    ```bash
@@ -53,7 +53,31 @@ No other code changes are needed. The API's `AddApiAuthentication()` in ServiceD
 
 The first time you generate a token for a given project, `dotnet user-jwts` also writes the issuer config into `src/AspireTemplate.SampleApi/appsettings.Development.json`. This file is safe to commit (it contains only the issuer name, not the signing key).
 
-## 4. Generate tokens in bulk (script)
+## 4. Generate a machine to machine (M2M) token on demand (Aspire dashboard)
+
+1. Start the AppHost:
+   ```bash
+   dotnet run --project infrastructure/AspireTemplate.AppHost
+   ```
+2. Open the Aspire dashboard (URL printed on startup).
+3. Find the **sample-api** resource and click **Generate M2M Token**.
+   <br>![Generate m2m token button](assets/generate-jwt-tokens/generate_m2m_token_button.png)
+4. A dialog appears with pre-filled inputs:
+   <br>![Generate m2m token input](assets/generate-jwt-tokens/token_m2m_input.png)
+
+   | Field     | Default                  | Description                                    |
+   | --------- | ------------------------ | ---------------------------------------------- |
+   | App ID    | `sample-api-m2m`         | Caller client id                               |
+   | Roles     | `api-reader, api-writer` | Comma-separated; e.g. `api-reader, api-writer` |
+   | Audience  | `sample-api`             | Must match the API audience config             |
+   | Valid for | `1d`                     | Lifetime: `1d`, `8h`, `365d`, etc.             |
+
+5. Click **Generate M2M Token**. The raw token appears in the notification panel — copy it.
+   <br>![Generated dev token](assets/generate-jwt-tokens/generated_m2m_token.png)
+
+The first time you generate a token for a given project, `dotnet user-jwts` also writes the issuer config into `src/AspireTemplate.SampleApi/appsettings.Development.json`. This file is safe to commit (it contains only the issuer name, not the signing key).
+
+## 5. Generate tokens in bulk (script)
 
 Run the script from the repo root to create tokens for all three standard identities at once:
 
@@ -78,7 +102,7 @@ Identities created by the script:
 | `dev-admin`      | `api-reader`, `api-writer`                     | `dev-admin`              |
 | `sample-api-m2m` | `api-reader`, `api-writer` + `client_id` claim | `sample-api-m2m` client  |
 
-## 5. Call a protected endpoint
+## 6. Call a protected endpoint
 
 ```bash
 curl http://localhost:<api-port>/api/secure/whoami \
@@ -90,7 +114,7 @@ curl http://localhost:<api-port>/api/secure/files \
 
 Replace `<api-port>` with the port shown in the Aspire dashboard for `sample-api`.
 
-## 6. List and inspect existing tokens
+## 7. List and inspect existing tokens
 
 ```bash
 # List all tokens issued for the project
@@ -100,7 +124,7 @@ dotnet user-jwts list --project src/AspireTemplate.SampleApi
 dotnet user-jwts print <ID> --show-all --project src/AspireTemplate.SampleApi
 ```
 
-## 7. Reset the signing key
+## 8. Reset the signing key
 
 Resetting the key immediately invalidates **all** previously issued tokens. All tokens must be re-generated afterwards.
 

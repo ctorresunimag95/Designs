@@ -110,6 +110,103 @@ internal static class UserJwtsExtensions
                 ]
             });
 
+        builder.WithCommand(
+            "generate-m2m-jwt",
+            "Generate M2M Token",
+            async context =>
+            {
+                var appId = context.Arguments.GetString("appId") ?? "sample-api-m2m";
+                var roles = context.Arguments.GetString("roles") ?? "api-reader";
+                var scope = context.Arguments.GetString("scope") ?? "api://sample-api/.default";
+                var audience = context.Arguments.GetString("audience") ?? "sample-api";
+                var validFor = context.Arguments.GetString("validFor") ?? "1d";
+
+                var roleFlags = string.Join(" ",
+                    roles.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                         .Select(r => $"--claim roles={r}"));
+
+                var psi = new ProcessStartInfo("dotnet",
+                    $"user-jwts create --project \"{projectPath}\" --name \"{appId}\" --claim client_id={appId} {roleFlags} --claim scope={scope} --audience {audience} --valid-for {validFor} --output token")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                };
+
+                using var proc = Process.Start(psi)!;
+                var token = (await proc.StandardOutput.ReadToEndAsync(context.CancellationToken)).Trim();
+                var error = await proc.StandardError.ReadToEndAsync(context.CancellationToken);
+                await proc.WaitForExitAsync(context.CancellationToken);
+
+                if (proc.ExitCode == 0 && !string.IsNullOrEmpty(token))
+                {
+                    var payload = new { Token = token };
+                    var jsonResult = System.Text.Json.JsonSerializer.Serialize(payload);
+
+                    return new ExecuteCommandResult
+                    {
+                        Success = true,
+                        Message = "M2M Token Generated",
+                        Data = new CommandResultData
+                        {
+                            Format = CommandResultFormat.Json,
+                            Value = jsonResult,
+                            DisplayImmediately = true,
+                        }
+                    };
+                }
+
+                context.Logger.LogError("dotnet user-jwts failed with exit code {ExitCode}. Error: {Error}", proc.ExitCode, error);
+                return new ExecuteCommandResult { Success = false, Message = $"dotnet user-jwts failed: {error}" };
+            },
+            new CommandOptions
+            {
+                IconName = "LockClosed",
+                Arguments =
+                [
+                    new InteractionInput
+                    {
+                        Name         = "appId",
+                        Label        = "App ID (client_id)",
+                        InputType    = InputType.Text,
+                        Required     = true,
+                        Value = "sample-api-m2m",
+                    },
+                    new InteractionInput
+                    {
+                        Name         = "roles",
+                        Label        = "App Roles (comma-separated)",
+                        InputType    = InputType.Text,
+                        Required     = true,
+                        Value = "api-reader",
+                    },
+                    new InteractionInput
+                    {
+                        Name         = "scope",
+                        Label        = "Scope",
+                        InputType    = InputType.Text,
+                        Required     = false,
+                        Value = "api://sample-api/.default",
+                    },
+                    new InteractionInput
+                    {
+                        Name         = "audience",
+                        Label        = "Audience",
+                        InputType    = InputType.Text,
+                        Required     = true,
+                        Value = "sample-api",
+                    },
+                    new InteractionInput
+                    {
+                        Name         = "validFor",
+                        Label        = "Valid for (e.g. 1d, 8h, 365d)",
+                        InputType    = InputType.Text,
+                        Required     = false,
+                        Value = "1d",
+                    },
+                ]
+            });
+
         return builder;
     }
 }
