@@ -1,427 +1,319 @@
-# Invoice Integration — Architecture Options
+# Invoice Integration — Option 1 Architecture
 
-## Context
+## Overview
 
-All options share the same core flow:
+**Per-Invoice Submission with Webhook + Polling Fallback**
 
-1. A **timer/cron** wakes up the processor.
-2. The processor reads pending invoices from the **source DB** and marks them as claimed (write permission is available).
-3. The processor acquires an **EDICOM OAuth 2.0 token** (`POST https://accounts.edicomgroup.com/token`) — cached until expiry, not per-invoice.
-4. Invoices are **submitted to EDICOM** (`POST /publish`).
-5. Final status is resolved via **webhook** (EDICOM calls us back) and/or **polling** (we call EDICOM's status endpoint).
+Each invoice is submitted individually to EDICOM. Both trigger types (cron batch and HTTP single-invoice) flow through the same intake path, then the same processor pipeline. Status is received via webhook callback (primary, lowest latency) with an async polling reconciler as a safety net for any missed callbacks.
 
-The two orthogonal decisions are:
-
-| Dimension           | Choice A                    | Choice B                              |
-| ------------------- | --------------------------- | ------------------------------------- |
-| **Processing unit** | One invoice per submit      | Batch of N invoices per run           |
-| **Status channel**  | Webhook (EDICOM pushes us)  | Polling (we pull) — or webhook + poll fallback |
-
-The four options below cover the practical combinations.
+> **Implementation plan:** see [IMPLEMENTATION-PHASES.md](IMPLEMENTATION-PHASES.md) for the phased delivery approach — payload builder first, EDICOM client behind an interface, triggers last.
 
 ---
 
-## Option 1 — Per-Invoice · Webhook + Polling Fallback
+## Trigger & Data Flow
 
-Each invoice is submitted individually. EDICOM calls our webhook with the final status. A background reconciler polls for any invoices that never received a callback (timeout guard).
+Trigger intake and processing are decoupled. Intake always upserts the invoice row in the integration table and then publishes a processor message. The processor consumes messages, claims the row atomically, and runs the same EDICOM flow.
 
 ```mermaid
 flowchart LR
-    Sched([Timer / Cron])
-    StatusSched([Reconciler Cron])
+  subgraph triggers["Triggers"]
+    direction TB
+    cron([Timer Cron])
+    http([HTTP /trigger/invoice])
+  end
 
-    subgraph Processor[Invoice Processor]
-        Poll[Read pending invoices\nmark Claimed in source DB]
-        Token[Acquire / refresh\nOAuth token]
-        Submit[POST /publish\nper invoice]
-        RecordTxn[Record transactionId\nStatus = WaitingConfirmation]
-    end
+  subgraph intake["Trigger Intake — executes on each trigger"]
+    direction TB
+    discover["Find candidate invoices\nfrom Source DB"]
+    upsert["Upsert invint.InvoiceIntegration\nStatus = Pending"]
+    publish[Publish invoiceNumber to queue]
+  end
 
-    subgraph Webhook[Webhook Handler]
-        Receive[Receive EDICOM callback]
-        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
-    end
+  subgraph broker["Message Broker"]
+    direction TB
+    q[(InvoiceProcessingQueue)]
+    dlq[(Dead-Letter Queue)]
+  end
 
-    subgraph Reconciler[Polling Fallback]
-        FindStale[Find WaitingConfirmation\nrows older than threshold]
-        PollStatus[GET status per transactionId]
-        RecordFallback[Record terminal status]
-    end
+  subgraph proc["Processor Consumer — executes per message"]
+    direction TB
+    consume[Consume message]
+    claim["Atomic claim row\nStatus = Claimed"]
+    gather[Gather invoice data]
+    validate[Validate EDICOM payload]
+    token[Acquire / refresh OAuth token]
+    submit["POST /publish · per invoice"]
+    record["Record transactionId\nStatus = WaitingConfirmation"]
+  end
 
-    Source[(Source DB\nREAD + WRITE)]
-    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
-    Edicom{{EDICOM iPaaS}}
+  edicom{{EDICOM iPaaS}}
 
-    Sched -- trigger --> Processor
-    Poll -- read + claim --> Source
-    Token -- POST token --> Edicom
-    Submit -- POST /publish --> Edicom
-    Edicom -- transactionId --> RecordTxn
-    RecordTxn -- write WaitingConfirmation --> Track
-    Edicom -- webhook callback --> Receive
-    RecordFinal -- update terminal status --> Track
-    StatusSched -- trigger --> Reconciler
-    FindStale -- read --> Track
-    PollStatus -- GET status --> Edicom
-    RecordFallback -- update terminal status --> Track
+  subgraph completion["Completion"]
+    direction TB
+    wh["Webhook handler\nVerify · write terminal status"]
+    rc([Reconciler Cron])
+    poll["Poll GET /messages\nby transactionId"]
+  end
+
+  sourcedb[(Source DB)]
+  extapi[(External APIs)]
+  otherdb[(Other DBs / Config)]
+  table[(invint.InvoiceIntegration)]
+
+  cron -->|fires| discover
+  sourcedb -->|"query candidates"| discover
+  http -->|"fires with invoiceNumber"| upsert
+  discover --> upsert
+  upsert -->|persist| table
+  upsert --> publish
+  publish --> q
+  q -. max retries .-> dlq
+
+  q -->|delivers message| consume
+  consume --> claim
+  claim -->|persist| table
+  claim --> gather
+  sourcedb -->|"core invoice fields"| gather
+  extapi -->|"enrichment data"| gather
+  otherdb -->|"config & supplemental"| gather
+  gather --> validate
+  validate --> token
+  token --> submit
+  submit -->|POST| edicom
+  submit --> record
+  record -->|persist| table
+
+  edicom -->|"POST callback — primary"| wh
+  wh -->|"write Acknowledged / Failed"| table
+
+  rc -->|"polls WaitingConfirmation past grace period"| poll
+  poll -->|GET /messages| edicom
+  poll -->|"write Acknowledged / Failed"| table
 ```
-
-**Tradeoffs**
-
-- Lowest latency for status — EDICOM pushes the result the moment it's available.
-- Requires a publicly reachable webhook endpoint (HTTPS, auth on the inbound call).
-- The polling fallback is a safety net only; in steady state it should rarely fire.
-- Token is acquired once per processor run and reused across all invoice submits in that run.
-- If the source DB has many pending invoices the processor loops through them one by one — throughput is limited by the timer interval and single-threaded submit rate.
 
 ---
 
-## Option 2 — Per-Invoice · Polling Only
+## Sequence Diagrams
 
-Same as Option 1 but the webhook handler is removed. Status is always resolved by the reconciler polling EDICOM's status endpoint.
+### 1. Timer Cron — Trigger Intake
+
+Cron fires, discovers candidate invoices from Source DB, and publishes one message per invoice to the queue.
 
 ```mermaid
-flowchart LR
-    Sched([Timer / Cron])
-    StatusSched([Reconciler Cron])
+sequenceDiagram
+  participant Cron as Timer Cron
+  participant Intake as Trigger Intake
+  participant SrcDB as Source DB
+  participant IntDB as invint.InvoiceIntegration
+  participant Queue as InvoiceProcessingQueue
 
-    subgraph Processor[Invoice Processor]
-        Poll[Read pending invoices\nmark Claimed in source DB]
-        Token[Acquire / refresh\nOAuth token]
-        Submit[POST /publish\nper invoice]
-        RecordTxn[Record transactionId\nStatus = WaitingConfirmation]
-    end
+  Cron->>Intake: fires (scheduled interval)
+  Intake->>SrcDB: query candidate invoices (last N hours)
+  SrcDB-->>Intake: invoice list
 
-    subgraph Reconciler[Status Reconciler]
-        FindPending[Find WaitingConfirmation rows]
-        PollStatus[GET status per transactionId]
-        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
-    end
-
-    Source[(Source DB\nREAD + WRITE)]
-    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
-    Edicom{{EDICOM iPaaS}}
-
-    Sched -- trigger --> Processor
-    Poll -- read + claim --> Source
-    Token -- POST token --> Edicom
-    Submit -- POST /publish --> Edicom
-    Edicom -- transactionId --> RecordTxn
-    RecordTxn -- write WaitingConfirmation --> Track
-    StatusSched -- trigger --> Reconciler
-    FindPending -- read --> Track
-    PollStatus -- GET status --> Edicom
-    RecordFinal -- update terminal status --> Track
+  loop for each candidate invoice
+    Intake->>IntDB: UPSERT invoiceNumber (Status = Pending)
+    IntDB-->>Intake: row upserted / refreshed
+    Intake->>Queue: publish invoiceNumber
+    Queue-->>Intake: acknowledged
+  end
 ```
-
-**Tradeoffs**
-
-- Simplest to deploy — no inbound webhook surface, no firewall rules to open.
-- Status latency is bounded by the reconciler interval (e.g., every 5 minutes), not real-time.
-- Higher EDICOM API call volume if there are many `WaitingConfirmation` rows; may hit rate limits at scale.
-- Correct choice if EDICOM's POST only returns a receipt (`transactionId`) and confirmation comes minutes later — polling is the only reliable mechanism regardless.
 
 ---
 
-## Option 3 — Batch Submit · Webhook + Polling Fallback
+### 2. HTTP Manual Trigger — Intake
 
-The processor reads N invoices per run and submits them to EDICOM in parallel (concurrent HTTP calls under the same token). Each invoice is still a separate EDICOM publish call — "batch" here refers to the DB read window and the concurrent submit fan-out, not a single multi-document EDICOM payload.
+An external caller submits a single invoice number. Intake upserts one row and publishes one message.
 
 ```mermaid
-flowchart LR
-    Sched([Timer / Cron])
-    StatusSched([Reconciler Cron])
+sequenceDiagram
+  participant Caller as External Caller
+  participant Handler as HTTP Trigger Handler
+  participant IntDB as invint.InvoiceIntegration
+  participant Queue as InvoiceProcessingQueue
 
-    subgraph Processor[Invoice Processor]
-        Poll[Read TOP N invoices\nmark batch Claimed in source DB]
-        Token[Acquire / refresh\nOAuth token]
-        Fan[Fan-out: concurrent\nPOST /publish per invoice]
-        RecordBatch[Record each transactionId\nStatus = WaitingConfirmation]
-    end
-
-    subgraph Webhook[Webhook Handler]
-        Receive[Receive EDICOM callback]
-        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
-    end
-
-    subgraph Reconciler[Polling Fallback]
-        FindStale[Find stale WaitingConfirmation rows]
-        PollStatus[GET status per transactionId]
-        RecordFallback[Record terminal status]
-    end
-
-    Source[(Source DB\nREAD + WRITE)]
-    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
-    Edicom{{EDICOM iPaaS}}
-
-    Sched -- trigger --> Processor
-    Poll -- read + claim batch --> Source
-    Token -- POST token --> Edicom
-    Fan -- N concurrent POST /publish --> Edicom
-    Edicom -- N transactionIds --> RecordBatch
-    RecordBatch -- bulk write WaitingConfirmation --> Track
-    Edicom -- webhook callback per invoice --> Receive
-    RecordFinal -- update terminal status --> Track
-    StatusSched -- trigger --> Reconciler
-    FindStale -- read --> Track
-    PollStatus -- GET status --> Edicom
-    RecordFallback -- update terminal status --> Track
+  Caller->>Handler: POST /trigger/invoice {invoiceNumber}
+  Handler->>IntDB: UPSERT invoiceNumber (Status = Pending)
+  IntDB-->>Handler: row upserted / refreshed
+  Handler->>Queue: publish invoiceNumber
+  Queue-->>Handler: acknowledged
+  Handler-->>Caller: 202 Accepted
 ```
-
-**Tradeoffs**
-
-- Significantly higher throughput than Option 1/2 — a single timer run can drain a large backlog.
-- Concurrent submits must respect EDICOM rate limits; use a semaphore or throttle (e.g., max 10 in-flight at a time).
-- Batch claiming in the source DB reduces the risk of another processor instance picking the same invoices (important if running multiple instances).
-- The token is acquired once for the whole batch — do not re-request per invoice.
-- Same webhook + polling fallback pattern as Option 1.
-
-> **Batch size cap.** Always bound `TOP N` (e.g. 100–500 per run). Unbounded reads risk memory pressure and a large claim window that blocks retries if the run fails mid-batch.
 
 ---
 
-## Option 4 — Batch Submit · Polling Only
+### 3. Processor Consumer — Claim, Enrich, and Submit
 
-Combines the batch fan-out from Option 3 with the polling-only status resolution from Option 2. Simplest end-to-end deployment.
+The processor consumes a queue message, claims the row, gathers all data from multiple sources, and submits to EDICOM.
 
 ```mermaid
-flowchart LR
-    Sched([Timer / Cron])
-    StatusSched([Reconciler Cron])
+sequenceDiagram
+  participant Queue as InvoiceProcessingQueue
+  participant Proc as Processor Consumer
+  participant IntDB as invint.InvoiceIntegration
+  participant SrcDB as Source DB
+  participant OtherDB as Other DBs / Config
+  participant ExtAPI as External APIs
+  participant Auth as Auth Server
+  participant Edicom as EDICOM iPaaS
 
-    subgraph Processor[Invoice Processor]
-        Poll[Read TOP N invoices\nmark batch Claimed in source DB]
-        Token[Acquire / refresh\nOAuth token]
-        Fan[Fan-out: concurrent\nPOST /publish per invoice]
-        RecordBatch[Record each transactionId\nStatus = WaitingConfirmation]
-    end
+  Queue->>Proc: deliver message (invoiceNumber)
+  Proc->>IntDB: atomic claim row (Status = Claimed)
+  IntDB-->>Proc: row claimed
 
-    subgraph Reconciler[Status Reconciler]
-        FindPending[Find WaitingConfirmation rows]
-        PollStatus[GET status per transactionId]
-        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
-    end
+  Proc->>SrcDB: fetch core invoice fields
+  SrcDB-->>Proc: invoice data
+  Proc->>OtherDB: fetch config & supplemental data
+  OtherDB-->>Proc: supplemental data
+  Proc->>ExtAPI: fetch enrichment data
+  ExtAPI-->>Proc: enrichment data
 
-    Source[(Source DB\nREAD + WRITE)]
-    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
-    Edicom{{EDICOM iPaaS}}
+  Proc->>Proc: validate full EDICOM payload
 
-    Sched -- trigger --> Processor
-    Poll -- read + claim batch --> Source
-    Token -- POST token --> Edicom
-    Fan -- N concurrent POST /publish --> Edicom
-    Edicom -- N transactionIds --> RecordBatch
-    RecordBatch -- bulk write WaitingConfirmation --> Track
-    StatusSched -- trigger --> Reconciler
-    FindPending -- read --> Track
-    PollStatus -- GET status --> Edicom
-    RecordFinal -- update terminal status --> Track
+  Proc->>Auth: POST /token (grant_type=password, scope=openid)
+  Auth-->>Proc: {access_token, expires_in: 3600}
+
+  Proc->>Edicom: POST /publish {invoice payload}
+  Edicom-->>Proc: {transactionId, status: submitted}
+
+  Proc->>IntDB: UPDATE transactionId + Status = WaitingConfirmation
+  IntDB-->>Proc: updated
+  Proc->>Queue: complete (acknowledge message)
 ```
-
-**Tradeoffs**
-
-- Best throughput with lowest operational surface — no inbound webhook, no TLS termination for callbacks.
-- Same rate-limit and batch-size-cap concerns as Option 3.
-- Status latency is reconciler-interval bounded (not real-time).
 
 ---
 
-## Option 5 — Poller + Queue + Processor (Per-Invoice or Batch) · Webhook + Polling Fallback
+### 4. Completion — Webhook Callback (primary) and Polling Reconciler (fallback)
 
-Splits finding and submitting into two independent services connected by a durable queue. The poller's only job is to find candidates and publish them fast; one or more processor instances consume from the queue at their own pace. Horizontal scale-out is trivial — add processor instances to increase EDICOM throughput without touching the poller.
+EDICOM pushes the terminal status via webhook. If the callback never arrives, the reconciler polls until a terminal status is received or max attempts are exhausted.
 
-Works in two sub-modes depending on how the processor consumes the queue:
-
-- **5a — Per-invoice**: processor dequeues one message at a time, submits one invoice to EDICOM per dequeue.
-- **5b — Batch**: processor dequeues N messages at once, fan-out submits them concurrently under a single token.
+#### 4a. Webhook callback
 
 ```mermaid
-flowchart LR
-    Sched([Timer / Cron])
-    StatusSched([Reconciler Cron])
+sequenceDiagram
+  participant Edicom as EDICOM iPaaS
+  participant WH as Webhook Handler
+  participant IntDB as invint.InvoiceIntegration
 
-    subgraph Poller[Invoice Poller]
-        Poll[Read pending invoices\nmark Claimed in source DB]
-        Publish[Publish InvoiceCandidate\nper invoice]
-    end
-
-    subgraph Processor[Invoice Processor\nscale horizontally]
-        Dequeue[Dequeue 1 msg\nor N msgs for batch]
-        Token[Acquire / refresh\nOAuth token]
-        Submit[POST /publish\nto EDICOM]
-        RecordTxn[Record transactionId\nStatus = WaitingConfirmation]
-    end
-
-    subgraph Webhook[Webhook Handler]
-        Receive[Receive EDICOM callback]
-        RecordFinal[Record ACKNOWLEDGED /\nREJECTED]
-    end
-
-    subgraph Reconciler[Polling Fallback]
-        FindStale[Find stale\nWaitingConfirmation rows]
-        PollStatus[GET status per transactionId]
-        RecordFallback[Record terminal status]
-    end
-
-    Source[(Source DB\nREAD + WRITE)]
-    Queue([Durable Queue\nAzure Service Bus /\nRabbitMQ])
-    Track[(invint.InvoiceDispatch\nUNIQUE InvoiceNumber)]
-    Edicom{{EDICOM iPaaS}}
-
-    Sched -- trigger --> Poller
-    Poll -- read + claim --> Source
-    Publish -- InvoiceCandidate --> Queue
-    Queue -- message(s) --> Dequeue
-    Token -- POST token --> Edicom
-    Submit -- POST /publish --> Edicom
-    Edicom -- transactionId --> RecordTxn
-    RecordTxn -- write WaitingConfirmation --> Track
-    Edicom -- webhook callback --> Receive
-    RecordFinal -- update terminal status --> Track
-    StatusSched -- trigger --> Reconciler
-    FindStale -- read --> Track
-    PollStatus -- GET status --> Edicom
-    RecordFallback -- update terminal status --> Track
+  Edicom->>WH: POST /webhook {transactionId, status, edicomReference, errorCode?}
+  WH->>WH: verify sender auth (HMAC / IP allowlist)
+  WH->>IntDB: query by transactionId
+  IntDB-->>WH: row found (WaitingConfirmation)
+  WH->>IntDB: UPDATE Status = Acknowledged / Failed
+  IntDB-->>WH: updated
+  WH-->>Edicom: 200 OK
 ```
 
-**Tradeoffs**
+#### 4b. Polling reconciler (fallback)
 
-- **Handles large backlogs gracefully** — if the poller finds 1 000 invoices it publishes 1 000 messages in seconds and is done; the processor(s) drain them at whatever rate EDICOM allows without any single run timing out.
-- **Horizontal scale-out** — add processor instances to increase throughput; the queue is the natural backpressure valve.
-- **Durable** — if a processor instance crashes mid-run the unacknowledged messages return to the queue and are retried by another instance; no invoices are lost.
-- **5b batch mode** reuses one OAuth token per dequeue batch, keeping token request volume low even at high throughput.
-- Extra moving part compared to Options 1–4 — requires a message broker (Azure Service Bus or RabbitMQ).
-- Queue message visibility timeout must be longer than the worst-case EDICOM submit time to avoid duplicate delivery.
+```mermaid
+sequenceDiagram
+  participant RCron as Reconciler Cron
+  participant Rec as Reconciler Service
+  participant IntDB as invint.InvoiceIntegration
+  participant Edicom as EDICOM iPaaS
 
-> **Batch size cap (5b).** Keep the dequeue window bounded (e.g. 50–200 per pull). Too large and a partial processor failure leaves a big unacknowledged window; too small and you lose the throughput benefit.
+  RCron->>Rec: fires (scheduled interval)
+  Rec->>IntDB: query Status = WaitingConfirmation AND SubmittedAt < NOW() - GraceMinutes
+  IntDB-->>Rec: stale rows
 
----
+  loop for each stale row
+    Rec->>Edicom: GET /messages?transactionId={id}
+    Edicom-->>Rec: status response
 
-## Per-Invoice vs Batch — Decision Guide
-
-| Factor                              | Per-Invoice (1 & 2)              | Batch (3 & 4)                          |
-| ----------------------------------- | -------------------------------- | -------------------------------------- |
-| **Expected daily volume**           | < ~500 invoices/day              | > 500 invoices/day or catch-up bursts  |
-| **Implementation effort**           | Lower                            | Slightly higher (throttle, batch claim)|
-| **EDICOM rate limit exposure**      | Lower per run                    | Higher per run — need throttle guard   |
-| **Backlog drain speed**             | One per cycle                    | N per cycle (configurable)             |
-| **Partial-batch failure handling**  | Simple — one invoice, one retry  | Must track which in batch succeeded    |
-
-**Recommendation:** start with **Option 2** (per-invoice, polling) to ship quickly and validate the full pipeline. If volume or backlog drain time becomes a concern, migrate to **Option 4** (batch, polling) or **Option 5b** (queue + batch processor) if you also need resilience against large catch-up bursts or want horizontal scale-out. Add webhook support (Options 1 / 3 / 5 with webhook) only if EDICOM's confirmed turnaround is real-time and status polling latency is unacceptable.
-
----
-
-## Option Comparison Matrix
-
-| Option                                          | Processing unit      | Status channel          | Complexity  | Throughput | Best fit                                                     |
-| ----------------------------------------------- | -------------------- | ----------------------- | :---------: | :--------: | ------------------------------------------------------------ |
-| **1** Per-Invoice · Webhook + Poll guard        | Single invoice       | Webhook (poll fallback) |   Medium    |    Low     | Low volume, real-time status required                        |
-| **2** Per-Invoice · Polling Only                | Single invoice       | Poll                    |     Low     |    Low     | Low volume, simplest to ship, status latency OK              |
-| **3** Batch · Webhook + Poll guard              | Batch of N           | Webhook (poll fallback) |    High     |    High    | High volume, real-time status required                       |
-| **4** Batch · Polling Only                      | Batch of N           | Poll                    |   Medium    |    High    | High volume, no webhook infrastructure, latency OK           |
-| **5a** Queue · Per-Invoice · Webhook + Poll     | Single invoice       | Webhook (poll fallback) |    High     |    High    | High volume + scale-out + resilience, real-time status       |
-| **5b** Queue · Batch · Webhook + Poll           | Batch of N per pull  | Webhook (poll fallback) |    High     |  Very High | High volume + scale-out + resilience, large backlog bursts   |
+    alt terminal status (acknowledged / failed)
+      Rec->>IntDB: UPDATE Status = Acknowledged / Failed
+    else still pending AND ReconcileAttempts < max
+      Rec->>IntDB: INCREMENT ReconcileAttempts
+    else ReconcileAttempts >= max
+      Rec->>IntDB: UPDATE Status = Failed (MaxAttemptsExceeded)
+      Rec->>Rec: trigger alert
+    end
+  end
+```
 
 ---
 
 ## Retry & Resiliency
 
-Each layer of the pipeline can fail independently. The table below maps failure modes to their recovery mechanism before the full explanations.
+Each layer of the pipeline can fail independently. The table below maps failure modes to their recovery mechanism.
 
-| Failure                                      | Recovery mechanism                                      | Applies to       |
-| -------------------------------------------- | ------------------------------------------------------- | ---------------- |
-| Transient EDICOM submit error (5xx / timeout)| Polly retry with exponential backoff                    | All options      |
-| EDICOM persistently unavailable              | Circuit breaker → abort run → stale claim recovery      | All options      |
-| Processor crash after claim, before submit   | Stale claim reset in next processor run                 | All options      |
-| Processor crash after submit, before record  | UNIQUE constraint prevents duplicate; reconciler covers | All options      |
-| Webhook callback never arrives               | Polling reconciler (polling fallback or primary)        | Options 1, 3, 5  |
-| WaitingConfirmation never resolves           | Reconciler max-attempts → mark Failed + alert           | All options      |
-| Token endpoint unavailable                   | Retry token fetch → abort run → stale claim recovery    | All options      |
-| Batch partial failure (some succeed, some not)| Per-invoice tracking; failed invoices reset by stale claim | Options 3, 4, 5b |
-| Queue message fails repeatedly (Option 5)   | Dead-letter queue (DLQ) → alert on DLQ depth            | Option 5 only    |
+| Failure                                        | Recovery mechanism                                                  |
+| ---------------------------------------------- | ------------------------------------------------------------------- |
+| Transient EDICOM submit error (5xx / timeout)  | Polly retry with exponential backoff                                |
+| EDICOM persistently unavailable                | Circuit breaker → abort run → stale claim recovery                  |
+| Processor crash after claim, before submit     | Stale claim reset in next processor run                             |
+| Processor crash after submit, before record    | Message redelivered; idempotent state transition prevents duplicate |
+| Webhook callback never arrives                 | Polling reconciler fires after `GraceMinutes`                       |
+| WaitingConfirmation never resolves             | Reconciler max-attempts → mark `Failed` + alert                     |
+| Token endpoint unavailable                     | Retry token fetch → abort run → stale claim recovery                |
+| Partial batch failure                          | Per-invoice tracking; failed invoices recover via stale claim reset |
+| Queue message fails repeatedly                 | Dead-letter queue (DLQ) → alert on DLQ depth                        |
 
 ---
 
-### Submit retry — Polly (all options)
+### Submit retry — Polly
 
 Every `POST /publish` call goes through a **retry + circuit-breaker** policy:
 
 ```
-Retry:          3 attempts, exponential backoff — 1 s → 2 s → 4 s
-Retry triggers: HTTP 429, 5xx, network timeout
+Retry:           3 attempts, exponential backoff — 1 s → 2 s → 4 s
+Retry triggers:  HTTP 429, 5xx, network timeout
 Circuit breaker: open after 5 consecutive failures; half-open probe after 30 s
 ```
 
-The circuit breaker prevents a full batch run from hammering a degraded EDICOM endpoint. When the breaker is open the processor aborts the current run; any already-claimed invoices are recovered by stale claim reset (see below).
+When the circuit breaker opens, the processor aborts the current run; already-claimed invoices are recovered by stale claim reset.
 
-Do **not** retry HTTP 400 / 422 — these indicate a malformed payload and retrying will always fail. Log the error, write `Failed` to the tracking table, and move on.
+Do **not** retry HTTP 400 / 422 — these indicate a malformed payload. Log the error, write `Failed` to `invint.InvoiceIntegration`, and move on.
 
 ---
 
-### Stale claim recovery (all options)
+### Stale claim recovery
 
-The source DB claim query always includes a timeout window:
+The claim query always includes a timeout window so crashed or abandoned claims are automatically recycled:
 
 ```sql
-UPDATE SourceInvoices
+UPDATE invint.InvoiceIntegration
 SET    Status = 'Claimed', ClaimedAt = GETUTCDATE()
 OUTPUT inserted.*
 WHERE  Status = 'Pending'
    OR (Status = 'Claimed' AND ClaimedAt < DATEADD(MINUTE, -@ClaimTimeoutMinutes, GETUTCDATE()))
 ```
 
-`ClaimTimeoutMinutes` (default: 30) must be larger than the worst-case run duration. Any invoice whose claim window expires — whether the processor crashed, the circuit breaker fired, or a batch submit timed out — is automatically re-entered into the next run without manual intervention.
-
-> **Batch note (Options 3, 4, 5b).** Track each invoice's submit result individually. A failed submit for invoice _k_ does not roll back the claims for invoices _k+1 … N_. Succeeded ones stay `WaitingConfirmation`; failed ones stay `Claimed` and expire normally.
+`ClaimTimeoutMinutes` (default: 30) must exceed the worst-case run duration. A failed submit for invoice _k_ does not roll back claims for _k+1 … N_ — each invoice is tracked independently.
 
 ---
 
-### WaitingConfirmation timeout — reconciler (all options)
+### WaitingConfirmation timeout — reconciler
 
-The reconciler acts as the last line of defence for invoices that never reach a terminal state:
+See sequence diagram 4b for the full flow. Key configuration parameters:
 
-1. Query `invint.InvoiceDispatch WHERE Status = 'WaitingConfirmation' AND SubmittedAt < NOW() - @GraceMinutes`.
-2. Call `GET /messages` for each `transactionId`.
-3. If EDICOM returns a terminal status → write `Acknowledged` or `Failed`.
-4. If EDICOM returns _still pending_ → increment `ReconcileAttempts`.
-5. If `ReconcileAttempts >= @MaxReconcilerAttempts` (default: 10) → write `Failed` with reason `MaxAttemptsExceeded` and trigger an alert.
-
-`GraceMinutes` for **webhook options** (1, 3, 5) should be longer than EDICOM's typical callback latency (e.g., 15 min) to avoid premature polling. For **polling-only options** (2, 4) set it to the desired status check interval (e.g., 5 min).
+- `GraceMinutes` — how long to wait before polling begins; must exceed EDICOM's typical callback latency (e.g., 15 min).
+- `MaxReconcilerAttempts` (default: 10) — after this many polling cycles with no terminal status, the row is written to `Failed` with reason `MaxAttemptsExceeded` and an alert is triggered.
 
 ---
 
-### Token acquisition failure (all options)
+### Token acquisition failure
 
-Token fetch is retried up to 3 times with a short backoff before the processor run aborts. If the token endpoint is unavailable:
-
-- Do **not** proceed to claim or submit — no invoices are touched.
-- All previously claimed invoices (from an earlier run) remain claimed and are recovered by the stale claim reset on the next successful run.
-- Alert on repeated token failures — this indicates an auth configuration issue, not a transient blip.
+Token fetch is retried up to 3 times with a short backoff before the processor run aborts. If the token endpoint is unavailable, claimed rows are left as `Claimed` and recovered by the stale claim reset on the next successful run. Alert on repeated token failures — this indicates an auth configuration issue, not a transient blip.
 
 ---
 
-### Missed webhook delivery (Options 1, 3, 5)
+### Missed webhook delivery
 
-EDICOM may not retry a webhook if our endpoint is unreachable or returns a non-2xx. This is the primary reason the polling fallback must always be enabled alongside the webhook. The sequence is:
-
-```
-EDICOM callback arrives  →  webhook handler writes terminal status  (fast path)
-Callback never arrives   →  reconciler fires after GraceMinutes     (safety net)
-```
-
-If the webhook handler itself crashes after receiving but before writing, the reconciler will still recover the invoice within one reconciler interval. The handler should be idempotent — a duplicate callback for the same `transactionId` must not create a duplicate record (rely on the `UNIQUE(InvoiceNumber)` constraint and an upsert-style update).
+EDICOM may not retry a webhook if the endpoint is unreachable or returns non-2xx. The polling reconciler (sequence diagram 4b) is the safety net that covers this case. The webhook handler must be idempotent — a duplicate callback for the same `transactionId` must not produce a duplicate state transition.
 
 ---
 
-### Dead-letter queue — Option 5 only
+### Dead-letter queue
 
-Configure Azure Service Bus (or equivalent) with `MaxDeliveryCount = 5`. After 5 failed delivery attempts the message is moved to the **dead-letter queue (DLQ)**:
+Configure the message broker (e.g., Azure Service Bus) with `MaxDeliveryCount = 5`. After 5 failed delivery attempts the message moves to the **dead-letter queue (DLQ)**:
 
-- Set up an alert when DLQ depth > 0.
-- A message lands in DLQ when the processor throws an unhandled exception on every delivery attempt. This typically signals a poison payload (schema mismatch, corrupted data) rather than a transient error — inspect before replaying.
-- The corresponding invoice remains `Claimed` in the source DB. After manual investigation, either fix and re-enqueue the message or reset the claim to `Pending` to allow re-discovery.
+- Alert when DLQ depth > 0.
+- A DLQ message typically signals a poison payload (schema mismatch, corrupted data), not a transient error — inspect before replaying.
+- The corresponding row remains `Claimed` in `invint.InvoiceIntegration`. After investigation, either fix and re-enqueue or reset the row to `Pending`.
 
-The processor must only acknowledge (complete) a message **after** successfully writing `WaitingConfirmation` to the tracking table. A crash between submit and record causes the message to be redelivered; the EDICOM submit will be retried and the UNIQUE constraint prevents a duplicate dispatch record.
+The processor must only acknowledge a message **after** successfully writing `WaitingConfirmation`. A crash between submit and record triggers redelivery; idempotent state transitions prevent duplicate lifecycle progression.
 
 ---
 
@@ -436,6 +328,7 @@ Below are the endpoints used at each step of the pipeline. All endpoints require
 **Purpose:** Acquire an OAuth 2.0 access token for subsequent API calls.
 
 **Request:**
+
 ```
 POST /token HTTP/1.1
 Host: accounts.edicomgroup.com
@@ -448,6 +341,7 @@ grant_type=password
 ```
 
 **Response:**
+
 ```json
 {
   "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
@@ -467,12 +361,14 @@ grant_type=password
 **Purpose:** Submit a single invoice document to EDICOM for processing.
 
 **Request headers:**
+
 ```
 Authorization: Bearer {access_token}
 Content-Type: application/json
 ```
 
 **Request body** (inferred from integration pattern):
+
 ```json
 {
   "document": {
@@ -486,6 +382,7 @@ Content-Type: application/json
 ```
 
 **Response** (expected):
+
 ```json
 {
   "transactionId": "TXN-abc123def456",
@@ -494,19 +391,20 @@ Content-Type: application/json
 }
 ```
 
-**Processor action:** Extract `transactionId`, record it in tracking DB with `Status = WaitingConfirmation`.
+**Processor action:** Extract `transactionId`, update `invint.InvoiceIntegration` with `Status = WaitingConfirmation`.
 
 > **Note:** EDICOM does not expose a batch endpoint. Submit invoices individually or concurrently under a single token (see Options 3/4/5b for concurrent patterns).
 
 ---
 
-### Step 3: Receive Status — Webhook (Options 1, 3, 5 only)
+### Step 3: Receive Status — Webhook (Option 1)
 
 **Endpoint:** `POST {your-webhook-url}` (inbound from EDICOM)
 
 **Purpose:** EDICOM pushes the final status of an invoice when processing completes.
 
 **Inbound request body** (expected):
+
 ```json
 {
   "transactionId": "TXN-abc123def456",
@@ -519,8 +417,9 @@ Content-Type: application/json
 ```
 
 **Webhook handler action:**
+
 1. Validate the request is from EDICOM (HMAC signature, IP allowlist, or bearer token).
-2. Query tracking DB for the `transactionId`.
+2. Query `invint.InvoiceIntegration` for the `transactionId`.
 3. Update `Status = Acknowledged` or `Failed`, record `EdicomReference` if present.
 4. Return HTTP 200 to confirm delivery.
 
@@ -535,12 +434,14 @@ Content-Type: application/json
 **Purpose:** Query the status of submitted invoices. Acts as the primary mechanism for polling-only options (2, 4) or fallback safety net for webhook options (1, 3, 5).
 
 **Request:**
+
 ```
 GET /messages?transactionId={transactionId}&status=*
 Authorization: Bearer {access_token}
 ```
 
 **Response** (expected):
+
 ```json
 {
   "messages": [
@@ -558,10 +459,11 @@ Authorization: Bearer {access_token}
 ```
 
 **Reconciler action:**
-1. Query tracking DB for `Status = WaitingConfirmation AND SubmittedAt < NOW() - @GraceMinutes`.
+
+1. Query `invint.InvoiceIntegration` for `Status = WaitingConfirmation AND SubmittedAt < NOW() - @GraceMinutes`.
 2. For each `transactionId`, call `GET /messages`.
-3. If status is `acknowledged` → update tracking DB to `Acknowledged`.
-4. If status is `failed` → update tracking DB to `Failed` with error code/message.
+3. If status is `acknowledged` → update the row to `Acknowledged`.
+4. If status is `failed` → update the row to `Failed` with error code/message.
 5. If still `pending` → increment `ReconcileAttempts`; if >= max, write `Failed` + alert.
 
 **Polling interval:** 5–15 minutes (configurable per option).
@@ -583,13 +485,21 @@ Authorization: Bearer {access_token}
 ## Shared Design Notes
 
 ### Token handling
+
 Acquire a token once per processor run (`POST https://accounts.edicomgroup.com/token`, scope `openid`). Cache it with its `expires_in` value and refresh proactively before expiry. Never request a new token per invoice.
 
 ### Idempotency
-The `invint.InvoiceDispatch` table must carry a `UNIQUE(InvoiceNumber)` constraint. If the processor crashes after submitting to EDICOM but before writing `WaitingConfirmation`, the retry will hit a duplicate-key error on the source DB claim — safe to skip.
 
-### Claim pattern in source DB
-Use a single `UPDATE ... SET Status = 'Claimed', ClaimedAt = NOW() WHERE Status = 'Pending' [AND ClaimedAt < NOW() - retry_timeout]` with `OUTPUT` / `RETURNING` to atomically claim invoices and prevent double-processing across concurrent runs.
+Use `invint.InvoiceIntegration.UNIQUE(InvoiceNumber)` to collapse duplicate trigger events and keep one lifecycle row per invoice.
+
+If the processor crashes after submit but before writing `WaitingConfirmation`, the same invoice may be retried; atomic state transitions and uniqueness keep persistence idempotent.
+
+### Claim pattern in integration table
+
+Use a single `UPDATE ... SET Status = 'Claimed', ClaimedAt = NOW() WHERE Status = 'Pending' [OR stale claimed]` with `OUTPUT` / `RETURNING` to atomically claim rows and prevent double-processing across concurrent runs.
+
+For cron discovery, source rows can still be marked `Claimed` (or equivalent) in the source system before upserting integration rows; HTTP trigger creates/refreshes one integration row directly.
 
 ### EDICOM status endpoint
+
 Until the webhook integration is confirmed, treat the `GET /messages` response (messages linked to a document / subscription messages) as the authoritative status source. The reconciler polls this for all `WaitingConfirmation` rows.
