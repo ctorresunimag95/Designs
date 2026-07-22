@@ -2,54 +2,58 @@
 
 ## Overview
 
-This document describes the internal architecture of the **Invoice Integration Service**: a scheduled batch worker that extracts invoice data from a read-only source SQL database and dispatches it to EDICOM (UAE ASP / Peppol Access Point).
+This document describes the internal architecture of the **Invoice Integration Service**: a scheduled worker that extracts invoice data from a source SQL database (read + write) and dispatches it to EDICOM (UAE ASP / Peppol Access Point) via the EDICOM iPaaS REST API.
+
+The design supports all architecture options defined in [ARCHITECTURE-OPTIONS.md](ARCHITECTURE-OPTIONS.md). The core domain and application layers are identical across all options. What varies per option is:
+
+| Dimension | Options | Variation point |
+|---|---|---|
+| **Processing unit** | 1, 2 → per-invoice · 3, 4 → batch · 5a, 5b → queue-fed | Orchestrator + queue adapters |
+| **Status channel** | 1, 3, 5 → webhook + poll fallback · 2, 4 → poll only | WebhookHandler + StatusReconciler |
+| **Token strategy** | All | `IEdicomTokenProvider` — cached OAuth 2.0 |
 
 The architecture combines two complementary patterns:
 
-- **Hexagonal Architecture (Ports & Adapters)** — defines the structural seams. The domain and application cores have zero knowledge of EDICOM, SQL Server, or Azure Functions. All external contracts are hidden behind interfaces (ports) and injected via adapters.
+- **Hexagonal Architecture (Ports & Adapters)** — defines the structural seams. The domain and application cores have zero knowledge of EDICOM, SQL Server, Azure Functions, or any message broker. All external contracts are hidden behind interfaces (ports) and injected via adapters.
 - **Step Pipeline + State Machine** — defines the workflow shape inside the application layer. Each processing step is an explicit use case with a typed input/output contract. Status transitions are governed by a state machine in the domain, not scattered ad-hoc conditionals.
-
-These two concerns are orthogonal: hexagonal answers *where the seams are*; the step pipeline answers *how the workflow is orchestrated*.
 
 ---
 
 ## Architecture Layers
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Driving Adapters (Infrastructure)                                   │
-│  AzureFunctionTimerAdapter  │  ManualTriggerAdapter (dev/test)       │
-└────────────────────┬─────────────────────────────────────────────────┘
-                     │  calls
-                     ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  Application Layer                                                   │
-│                                                                      │
-│  RunDispatchBatchUseCase  (orchestrator)                             │
-│    │                                                                 │
-│    ├─► ExtractCandidatesUseCase   (step 1)                           │
-│    ├─► ClaimInvoiceUseCase        (step 2)                           │
-│    ├─► ValidateInvoiceUseCase     (step 3)                           │
-│    ├─► SubmitToEdicomUseCase      (step 4)                           │
-│    └─► RecordOutcomeUseCase       (step 5)                           │
-│                                                                      │
-│  Driven Ports (interfaces)                                           │
-│  ISourceInvoiceRepository  IDispatchStore  IInvoicePublisher         │
-│  IRunStateStore             IPayloadMapper                           │
-└───────┬───────────────┬──────────────┬───────────────────────────────┘
-        │               │              │
-        ▼               ▼              ▼
-┌────────────┐  ┌──────────────┐  ┌──────────────────────────┐
-│  Domain    │  │  Driven      │  │  Driven Adapters         │
-│  Layer     │  │  Adapters    │  │  (Infrastructure)        │
-│            │  │  (SQL)       │  │                          │
-│ Entities   │  │ SqlSource    │  │ EdicomInvoicePublisher   │
-│ ValueObjs  │  │ InvoiceRepo  │  │ EdicomPayloadMapper      │
-│ State      │  │ SqlDispatch  │  │                          │
-│ Machine    │  │ Store        │  │                          │
-│            │  │ SqlRunState  │  │                          │
-│            │  │ Store        │  │                          │
-└────────────┘  └──────────────┘  └──────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│  Driving Adapters (Infrastructure)                                                 │
+│  AzureFunctionTimerAdapter  │  QueueConsumerAdapter (Option 5)                     │
+│  WebhookHandlerAdapter      │  ManualTriggerAdapter (dev/test)                     │
+└──────────────┬──────────────────────────┬──────────────────────────────────────────┘
+               │ calls                    │ calls
+               ▼                          ▼
+┌──────────────────────────┐  ┌───────────────────────────────────────────────────────┐
+│  Application Layer       │  │  Application Layer                                    │
+│                          │  │                                                       │
+│  RunDispatchBatchUseCase │  │  HandleWebhookCallbackUseCase                         │
+│  (orchestrator)          │  │  ReconcileStatusUseCase                               │
+│    │                     │  │                                                       │
+│    ├─► ExtractCandidates │  │  Driven Ports (interfaces)                            │
+│    ├─► ClaimInvoice      │  │  ISourceInvoiceRepository  IDispatchStore             │
+│    ├─► ValidateInvoice   │  │  IInvoicePublisher         IEdicomTokenProvider        │
+│    ├─► SubmitToEdicom    │  │  IRunStateStore             IPayloadMapper             │
+│    └─► RecordSubmission  │  │  IInvoiceQueuePublisher    IEdicomStatusClient         │
+└──────────────────────────┘  └───────────────────────────────────────────────────────┘
+        │                                      │
+        ▼                                      ▼
+┌────────────┐  ┌──────────────┐  ┌──────────────────────────────────────────────────┐
+│  Domain    │  │  SQL         │  │  Driven Adapters (Infrastructure)                │
+│  Layer     │  │  Adapters    │  │                                                  │
+│            │  │              │  │  EdicomInvoicePublisher  (IInvoicePublisher)      │
+│ Entities   │  │ SqlSource    │  │  EdicomTokenProvider     (IEdicomTokenProvider)   │
+│ ValueObjs  │  │ InvoiceRepo  │  │  EdicomStatusClient      (IEdicomStatusClient)    │
+│ State      │  │ SqlDispatch  │  │  EdicomPayloadMapper     (IPayloadMapper)         │
+│ Machine    │  │ Store        │  │  ServiceBusQueuePublisher (IInvoiceQueuePublisher)│
+│            │  │ SqlRunState  │  │  (Azure Service Bus / RabbitMQ adapters)          │
+│            │  │ Store        │  │                                                  │
+└────────────┘  └──────────────┘  └──────────────────────────────────────────────────┘
 ```
 
 ---
@@ -74,23 +78,30 @@ InvoiceIntegrator/
 │   │   ├── ISourceInvoiceRepository.cs
 │   │   ├── IDispatchStore.cs
 │   │   ├── IInvoicePublisher.cs
+│   │   ├── IEdicomTokenProvider.cs     # OAuth 2.0 token cache
+│   │   ├── IEdicomStatusClient.cs      # poll EDICOM status per transactionId
 │   │   ├── IRunStateStore.cs
-│   │   └── IPayloadMapper.cs
+│   │   ├── IPayloadMapper.cs
+│   │   └── IInvoiceQueuePublisher.cs   # Option 5 only — publish candidates to queue
 │   │
 │   ├── Pipeline/                       # step abstraction + context
 │   │   ├── IDispatchStep.cs
 │   │   ├── InvoiceDispatchContext.cs
 │   │   └── StepOutcome.cs
 │   │
-│   ├── UseCases/                       # one file per step = one use case
+│   ├── UseCases/
 │   │   ├── ExtractCandidatesUseCase.cs
 │   │   ├── ClaimInvoiceUseCase.cs
 │   │   ├── ValidateInvoiceUseCase.cs
 │   │   ├── SubmitToEdicomUseCase.cs
-│   │   └── RecordOutcomeUseCase.cs
+│   │   ├── RecordSubmissionUseCase.cs  # records transactionId + WaitingConfirmation
+│   │   ├── HandleWebhookCallbackUseCase.cs  # Options 1, 3, 5
+│   │   └── ReconcileStatusUseCase.cs        # all options (primary or fallback)
 │   │
 │   └── Orchestration/
-│       └── RunDispatchBatchUseCase.cs  # composes the five steps
+│       ├── RunDispatchBatchUseCase.cs  # per-invoice sequential (Options 1, 2)
+│       ├── RunDispatchBatchBatchUseCase.cs  # batch fan-out (Options 3, 4)
+│       └── PublishCandidatesToQueueUseCase.cs  # Option 5 — poller side
 │
 └── Infrastructure/
     ├── Persistence/
@@ -99,10 +110,17 @@ InvoiceIntegrator/
     │   └── SqlRunStateStore.cs
     ├── Edicom/
     │   ├── EdicomInvoicePublisher.cs   # IInvoicePublisher adapter + Polly
-    │   └── EdicomPayloadMapper.cs      # IPayloadMapper adapter
+    │   ├── EdicomTokenProvider.cs      # OAuth 2.0 token cache
+    │   ├── EdicomStatusClient.cs       # IEdicomStatusClient adapter
+    │   └── EdicomPayloadMapper.cs      # IPayloadMapper adapter (ACL)
+    ├── Messaging/
+    │   └── ServiceBusQueuePublisher.cs # IInvoiceQueuePublisher (Option 5)
     └── Host/
-        ├── AzureFunctionTimerAdapter.cs
-        └── DependencyInjection.cs      # composition root
+        ├── AzureFunctionTimerAdapter.cs       # drives RunDispatchBatchUseCase
+        ├── AzureFunctionReconcilerAdapter.cs  # drives ReconcileStatusUseCase
+        ├── AzureFunctionWebhookAdapter.cs     # drives HandleWebhookCallbackUseCase (Options 1, 3, 5)
+        ├── AzureFunctionQueueConsumerAdapter.cs  # drives processor from queue (Option 5)
+        └── DependencyInjection.cs
 ```
 
 ---
@@ -113,7 +131,7 @@ The domain layer contains only pure C# — no NuGet dependencies, no framework r
 
 ### `DispatchStatus` — State Machine
 
-The state machine lives in the domain so transitions are enforced in one place.
+`WaitingConfirmation` is added to represent the state after EDICOM accepts the submission but before it returns a final outcome. This is the normal intermediate state in all options — webhook or reconciler resolves it to a terminal state.
 
 ```csharp
 // Domain/ValueObjects/DispatchStatus.cs
@@ -121,33 +139,42 @@ public enum DispatchStatus
 {
     Pending,
     Claimed,
-    Sent,
-    Acknowledged,   // terminal
-    Failed,         // terminal (until manual replay)
+    Submitted,              // EDICOM POST accepted, transactionId recorded
+    WaitingConfirmation,    // transactionId stored, awaiting final EDICOM outcome
+    Acknowledged,           // terminal
+    Failed,                 // terminal (until manual replay)
     Retryable,
-    DeadLettered    // terminal (until manual replay)
+    DeadLettered            // terminal (until manual replay)
 }
 
 public static class DispatchStatusTransitions
 {
-    // Valid (from, to) pairs — enforced by InvoiceDispatch aggregate
     private static readonly HashSet<(DispatchStatus, DispatchStatus)> _allowed = new()
     {
-        (DispatchStatus.Pending,    DispatchStatus.Claimed),
-        (DispatchStatus.Retryable,  DispatchStatus.Claimed),
-        (DispatchStatus.Claimed,    DispatchStatus.Sent),
-        (DispatchStatus.Sent,       DispatchStatus.Acknowledged),
-        (DispatchStatus.Sent,       DispatchStatus.Failed),
-        (DispatchStatus.Sent,       DispatchStatus.Retryable),
-        (DispatchStatus.Retryable,  DispatchStatus.DeadLettered),
-        // Manual replay resets to Retryable
-        (DispatchStatus.Failed,       DispatchStatus.Retryable),
-        (DispatchStatus.DeadLettered, DispatchStatus.Retryable),
+        (DispatchStatus.Pending,              DispatchStatus.Claimed),
+        (DispatchStatus.Retryable,            DispatchStatus.Claimed),
+        (DispatchStatus.Claimed,              DispatchStatus.Submitted),
+        (DispatchStatus.Submitted,            DispatchStatus.WaitingConfirmation),
+        (DispatchStatus.WaitingConfirmation,  DispatchStatus.Acknowledged),
+        (DispatchStatus.WaitingConfirmation,  DispatchStatus.Failed),
+        (DispatchStatus.Submitted,            DispatchStatus.Retryable),   // transient EDICOM error
+        (DispatchStatus.Retryable,            DispatchStatus.DeadLettered),
+        (DispatchStatus.Failed,               DispatchStatus.Retryable),   // manual replay
+        (DispatchStatus.DeadLettered,         DispatchStatus.Retryable),
     };
 
     public static bool IsAllowed(DispatchStatus from, DispatchStatus to)
         => _allowed.Contains((from, to));
 }
+```
+
+**State flow:**
+
+```
+Pending ──► Claimed ──► Submitted ──► WaitingConfirmation ──► Acknowledged
+                   │                                      └──► Failed
+                   └──► Retryable ──► (Claimed again on next run)
+                              └──► DeadLettered
 ```
 
 ### `InvoiceDispatch` — Aggregate
@@ -156,61 +183,48 @@ public static class DispatchStatusTransitions
 // Domain/Entities/InvoiceDispatch.cs
 public sealed class InvoiceDispatch
 {
-    public string        InvoiceNumber    { get; private set; }
-    public string        SourceSystem     { get; private set; }
-    public DispatchStatus Status          { get; private set; }
-    public int           AttemptCount     { get; private set; }
-    public string?       PayloadHash      { get; private set; }
-    public string?       EdicomReference  { get; private set; }
-    public Guid?         InvoiceUuid      { get; private set; }
-    public string?       LastErrorCode    { get; private set; }
-    public string?       LastErrorMessage { get; private set; }
-    public string?       ClaimedBy        { get; private set; }
-    public DateTime?     ClaimedAtUtc     { get; private set; }
-    public DateTime?     NextAttemptAtUtc { get; private set; }
-    public DateTime      CreatedAtUtc     { get; private set; }
-    public DateTime      UpdatedAtUtc     { get; private set; }
-    public DateTime?     AcknowledgedAtUtc { get; private set; }
+    public string         InvoiceNumber       { get; private set; }
+    public string         SourceSystem        { get; private set; }
+    public DispatchStatus Status              { get; private set; }
+    public int            AttemptCount        { get; private set; }
+    public string?        PayloadHash         { get; private set; }
+    public string?        EdicomTransactionId { get; private set; }  // set on Submitted
+    public string?        EdicomReference     { get; private set; }  // set on Acknowledged
+    public string?        LastErrorCode       { get; private set; }
+    public string?        LastErrorMessage    { get; private set; }
+    public string?        ClaimedBy           { get; private set; }
+    public DateTime?      ClaimedAtUtc        { get; private set; }
+    public DateTime?      NextAttemptAtUtc    { get; private set; }
+    public DateTime       CreatedAtUtc        { get; private set; }
+    public DateTime       UpdatedAtUtc        { get; private set; }
+    public DateTime?      AcknowledgedAtUtc   { get; private set; }
 
-    // Factory — called when a new invoice is first discovered
-    public static InvoiceDispatch CreatePending(string invoiceNumber, string sourceSystem)
-        => new() { InvoiceNumber = invoiceNumber, SourceSystem = sourceSystem,
-                   Status = DispatchStatus.Pending, CreatedAtUtc = DateTime.UtcNow,
-                   UpdatedAtUtc = DateTime.UtcNow };
+    public static InvoiceDispatch CreatePending(string invoiceNumber, string sourceSystem) => ...;
 
-    // All state changes go through Transition — enforces the state machine
-    public void Transition(DispatchStatus to, Action<InvoiceDispatch> mutate)
-    {
-        if (!DispatchStatusTransitions.IsAllowed(Status, to))
-            throw new InvalidStatusTransitionException(InvoiceNumber, Status, to);
+    public void Transition(DispatchStatus to, Action<InvoiceDispatch> mutate) { ... }
 
-        mutate(this);
-        Status      = to;
-        UpdatedAtUtc = DateTime.UtcNow;
-    }
+    public void Claim(string runId) => ...;
+    public void MarkSubmitted(string payloadHash, string transactionId)
+        => Transition(DispatchStatus.Submitted, d =>
+        {
+            d.PayloadHash         = payloadHash;
+            d.EdicomTransactionId = transactionId;
+            d.AttemptCount++;
+        });
 
-    public void Claim(string runId)
-        => Transition(DispatchStatus.Claimed, d => { d.ClaimedBy = runId; d.ClaimedAtUtc = DateTime.UtcNow; });
+    public void MarkWaitingConfirmation()
+        => Transition(DispatchStatus.WaitingConfirmation, _ => { });
 
-    public void MarkSent(string payloadHash)
-        => Transition(DispatchStatus.Sent, d => { d.PayloadHash = payloadHash; d.AttemptCount++; });
-
-    public void Acknowledge(string edicomReference, Guid invoiceUuid)
+    public void Acknowledge(string edicomReference)
         => Transition(DispatchStatus.Acknowledged, d =>
         {
             d.EdicomReference   = edicomReference;
-            d.InvoiceUuid       = invoiceUuid;
             d.AcknowledgedAtUtc = DateTime.UtcNow;
         });
 
-    public void Fail(string errorCode, string errorMessage)
-        => Transition(DispatchStatus.Failed, d => { d.LastErrorCode = errorCode; d.LastErrorMessage = errorMessage; });
-
-    public void ScheduleRetry(DateTime nextAttempt)
-        => Transition(DispatchStatus.Retryable, d => d.NextAttemptAtUtc = nextAttempt);
-
-    public void DeadLetter(string reason)
-        => Transition(DispatchStatus.DeadLettered, d => d.LastErrorMessage = reason);
+    public void Fail(string errorCode, string errorMessage) => ...;
+    public void ScheduleRetry(DateTime nextAttempt) => ...;
+    public void DeadLetter(string reason) => ...;
 }
 ```
 
@@ -218,17 +232,16 @@ public sealed class InvoiceDispatch
 
 ```csharp
 // Domain/Entities/SourceInvoice.cs
-// Pure data carrier — no behaviour. Fields are confirmed against the source schema.
 public sealed class SourceInvoice
 {
     public required string   InvoiceNumber  { get; init; }
-    public required long     WatermarkValue { get; init; }  // confirmed monotonic field
+    public required long     WatermarkValue { get; init; }
     public required DateTime InvoiceDate    { get; init; }
     public required string   CustomerName   { get; init; }
     public required string   CustomerVatId  { get; init; }
     public required decimal  TotalAmount    { get; init; }
     public required string   CurrencyCode   { get; init; }
-    // ... additional fields to be confirmed with source DB owner
+    // ... additional fields confirmed with source DB owner
 }
 ```
 
@@ -238,57 +251,67 @@ public sealed class SourceInvoice
 
 ### Driven Ports
 
-These interfaces are the boundary between the application and infrastructure. The application depends *only* on these contracts — never on concrete implementations.
-
 ```csharp
-// Application/Ports/ISourceInvoiceRepository.cs
+// ISourceInvoiceRepository.cs — read-only; enforced by NetArchTest
 public interface ISourceInvoiceRepository
 {
-    // Returns invoices with watermarkField > lastHighWaterMark
-    Task<IReadOnlyList<SourceInvoice>> GetCandidatesAsync(
-        long lastHighWaterMark, CancellationToken ct);
+    Task<IReadOnlyList<SourceInvoice>> GetCandidatesAsync(long lastHighWaterMark, CancellationToken ct);
 }
 
-// Application/Ports/IDispatchStore.cs
+// IDispatchStore.cs
 public interface IDispatchStore
 {
     Task<InvoiceDispatch?> FindByInvoiceNumberAsync(string invoiceNumber, CancellationToken ct);
     Task InsertPendingAsync(InvoiceDispatch dispatch, CancellationToken ct);
-
-    // Atomic claim: Pending/Retryable → Claimed using UPDATE…OUTPUT + row lock
-    // Returns false if race-lost (another run claimed it first)
     Task<bool> TryClaimAsync(string invoiceNumber, string runId, CancellationToken ct);
-
     Task UpdateAsync(InvoiceDispatch dispatch, CancellationToken ct);
+    Task<IReadOnlyList<InvoiceDispatch>> GetDueForProcessingAsync(DateTime visibilityTimeout, CancellationToken ct);
 
-    // Returns rows that are Retryable with NextAttemptAtUtc <= now,
-    // or Claimed/Sent with ClaimedAtUtc older than visibilityTimeout (stale claim)
-    Task<IReadOnlyList<InvoiceDispatch>> GetDueForProcessingAsync(
-        DateTime visibilityTimeout, CancellationToken ct);
+    // Used by reconciler — returns WaitingConfirmation rows older than graceThreshold
+    Task<IReadOnlyList<InvoiceDispatch>> GetWaitingConfirmationAsync(DateTime graceThreshold, CancellationToken ct);
 }
 
-// Application/Ports/IInvoicePublisher.cs
+// IEdicomTokenProvider.cs — OAuth 2.0 token cache; one token per run, not per invoice
+public interface IEdicomTokenProvider
+{
+    // Returns a valid Bearer token, refreshing proactively when near expiry.
+    Task<string> GetTokenAsync(CancellationToken ct);
+}
+
+// IInvoicePublisher.cs
 public interface IInvoicePublisher
 {
-    // Raises PublisherTransientException or PublisherPermanentException on failure.
-    // On success, returns the EDICOM-assigned reference and UUID.
-    Task<PublishResult> PublishAsync(SourceInvoice invoice, CancellationToken ct);
+    // Returns EDICOM-assigned transactionId on success.
+    // Throws PublisherTransientException or PublisherPermanentException on failure.
+    Task<string> PublishAsync(SourceInvoice invoice, string bearerToken, CancellationToken ct);
 }
 
-// Application/Ports/IRunStateStore.cs
+// IEdicomStatusClient.cs — used by reconciler and webhook fallback
+public interface IEdicomStatusClient
+{
+    // Polls EDICOM status endpoint for the given transactionId.
+    Task<EdicomStatusResult> GetStatusAsync(string transactionId, string bearerToken, CancellationToken ct);
+}
+
+// IRunStateStore.cs
 public interface IRunStateStore
 {
-    Task<long>  GetHighWaterMarkAsync(CancellationToken ct);
-    Task        SetHighWaterMarkAsync(long value, CancellationToken ct);
+    Task<long> GetHighWaterMarkAsync(CancellationToken ct);
+    Task SetHighWaterMarkAsync(long value, CancellationToken ct);
 }
 
-// Application/Ports/IPayloadMapper.cs
-// Optional seam: the application can validate the mapped payload before submission.
-// Concrete mapping (source fields → AE PINT/UBL) lives in the infrastructure adapter.
+// IPayloadMapper.cs
 public interface IPayloadMapper
 {
-    // Returns validation errors, or empty collection if payload is valid.
     Task<IReadOnlyList<string>> ValidateAsync(SourceInvoice invoice, CancellationToken ct);
+    Task<object> MapAsync(SourceInvoice invoice, CancellationToken ct);
+}
+
+// IInvoiceQueuePublisher.cs — Option 5 only
+public interface IInvoiceQueuePublisher
+{
+    Task PublishCandidateAsync(SourceInvoice invoice, CancellationToken ct);
+    Task PublishCandidatesBatchAsync(IReadOnlyList<SourceInvoice> invoices, CancellationToken ct);
 }
 ```
 
@@ -296,458 +319,371 @@ public interface IPayloadMapper
 
 ### Step Pipeline Abstraction
 
-```csharp
-// Application/Pipeline/InvoiceDispatchContext.cs
-// The single object that flows through every step in the pipeline.
-public sealed class InvoiceDispatchContext
-{
-    public required SourceInvoice    Source      { get; init; }
-    public required InvoiceDispatch  Dispatch    { get; set; }
-    public required string           RunId       { get; init; }
-    public          PublishResult?   PublishResult { get; set; }  // set by SubmitStep
-}
+Unchanged from the original design. `InvoiceDispatchContext`, `StepOutcome`, and `IDispatchStep` remain the same. The pipeline flows:
 
-// Application/Pipeline/StepOutcome.cs
-public enum StepOutcomeKind { Continue, Skip, Abort }
-
-public sealed class StepOutcome
-{
-    public StepOutcomeKind Kind    { get; private init; }
-    public string?         Reason { get; private init; }
-
-    public static StepOutcome Continue()              => new() { Kind = StepOutcomeKind.Continue };
-    public static StepOutcome Skip(string reason)     => new() { Kind = StepOutcomeKind.Skip,  Reason = reason };
-    public static StepOutcome Abort(string reason)    => new() { Kind = StepOutcomeKind.Abort, Reason = reason };
-}
-
-// Application/Pipeline/IDispatchStep.cs
-public interface IDispatchStep
-{
-    string Name { get; }
-
-    // Mutates context in place. Returns Continue/Skip/Abort to direct the orchestrator.
-    Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext context, CancellationToken ct);
-}
+```
+Claim → Validate → Submit → RecordSubmission
 ```
 
-**Why `StepOutcome` instead of exceptions for flow control?**
-- `Skip` = this invoice should be skipped this run (e.g. already acknowledged, race-lost claim) — not an error
-- `Abort` = this invoice cannot proceed this run (e.g. validation failed, dead-lettered) — recorded, no crash
-- `Continue` = proceed to next step
-Exceptions are reserved for unexpected infrastructure failures.
+`RecordSubmission` replaces the former `RecordOutcome`. It records the `transactionId` and sets `WaitingConfirmation`. Final status (`Acknowledged` / `Failed`) is resolved outside the pipeline by the **WebhookHandler** or **StatusReconciler**.
 
 ---
 
 ### Use Cases (Steps)
 
-Each step is a discrete class registered in DI. The orchestrator receives them as an ordered `IReadOnlyList<IDispatchStep>`.
+#### Step 1 — `ExtractCandidatesUseCase` (unchanged)
+Reads from source DB using watermark + due-retries merge. Not a pipeline step — runs once per batch.
 
-#### Step 1 — `ExtractCandidatesUseCase`
+#### Step 2 — `ClaimInvoiceUseCase` (unchanged)
+Atomically claims `Pending` / `Retryable` rows. Returns `Skip` if race-lost.
 
-This step does not implement `IDispatchStep` — it runs once per batch, not per invoice. It feeds the pipeline with the candidate set.
-
-```csharp
-// Application/UseCases/ExtractCandidatesUseCase.cs
-public sealed class ExtractCandidatesUseCase
-{
-    private readonly ISourceInvoiceRepository _source;
-    private readonly IDispatchStore           _store;
-    private readonly IRunStateStore           _runState;
-
-    public ExtractCandidatesUseCase(
-        ISourceInvoiceRepository source, IDispatchStore store, IRunStateStore runState)
-        => (_source, _store, _runState) = (source, store, runState);
-
-    public async Task<IReadOnlyList<InvoiceDispatchContext>> ExecuteAsync(
-        string runId, DispatchOptions options, CancellationToken ct)
-    {
-        var watermark    = await _runState.GetHighWaterMarkAsync(ct);
-        var sourceRows   = await _source.GetCandidatesAsync(watermark, ct);
-        var visTimeout   = DateTime.UtcNow.AddMinutes(-options.VisibilityTimeoutMinutes);
-        var dueRetries   = await _store.GetDueForProcessingAsync(visTimeout, ct);
-
-        // Merge: new source rows + due retries, deduplicated by InvoiceNumber
-        var byNumber     = dueRetries.ToDictionary(d => d.InvoiceNumber);
-        var contexts     = new List<InvoiceDispatchContext>();
-
-        foreach (var src in sourceRows)
-        {
-            if (!byNumber.TryGetValue(src.InvoiceNumber, out var dispatch))
-                dispatch = InvoiceDispatch.CreatePending(src.InvoiceNumber, options.SourceSystem);
-
-            contexts.Add(new InvoiceDispatchContext
-            {
-                Source   = src,
-                Dispatch = dispatch,
-                RunId    = runId,
-            });
-        }
-
-        return contexts;
-    }
-}
-```
-
-#### Step 2 — `ClaimInvoiceUseCase`
-
-```csharp
-// Application/UseCases/ClaimInvoiceUseCase.cs
-public sealed class ClaimInvoiceUseCase : IDispatchStep
-{
-    public string Name => "Claim";
-
-    private readonly IDispatchStore _store;
-    public ClaimInvoiceUseCase(IDispatchStore store) => _store = store;
-
-    public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
-    {
-        // Insert row if brand-new (UNIQUE constraint rejects concurrent duplicates)
-        if (ctx.Dispatch.Status == DispatchStatus.Pending && ctx.Dispatch.CreatedAtUtc == ctx.Dispatch.UpdatedAtUtc)
-            await _store.InsertPendingAsync(ctx.Dispatch, ct);
-
-        var claimed = await _store.TryClaimAsync(ctx.Dispatch.InvoiceNumber, ctx.RunId, ct);
-        if (!claimed)
-            return StepOutcome.Skip("Race-lost: claimed by another run");
-
-        ctx.Dispatch.Claim(ctx.RunId);
-        return StepOutcome.Continue();
-    }
-}
-```
-
-#### Step 3 — `ValidateInvoiceUseCase`
-
-```csharp
-// Application/UseCases/ValidateInvoiceUseCase.cs
-public sealed class ValidateInvoiceUseCase : IDispatchStep
-{
-    public string Name => "Validate";
-
-    private readonly IPayloadMapper  _mapper;
-    private readonly IDispatchStore  _store;
-
-    public ValidateInvoiceUseCase(IPayloadMapper mapper, IDispatchStore store)
-        => (_mapper, _store) = (mapper, store);
-
-    public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
-    {
-        var errors = await _mapper.ValidateAsync(ctx.Source, ct);
-        if (!errors.Any())
-            return StepOutcome.Continue();
-
-        // Validation failure is permanent — mark Failed immediately, no retry
-        ctx.Dispatch.Fail("VALIDATION_ERROR", string.Join("; ", errors));
-        await _store.UpdateAsync(ctx.Dispatch, ct);
-        return StepOutcome.Abort($"Validation failed: {errors.First()}");
-    }
-}
-```
+#### Step 3 — `ValidateInvoiceUseCase` (unchanged)
+Maps and validates against AE PINT schema. Returns `Abort(Failed)` on permanent validation error.
 
 #### Step 4 — `SubmitToEdicomUseCase`
 
+Acquires a token via `IEdicomTokenProvider` (cached — not per-invoice), submits, records the transactionId. Polly retry + circuit breaker live in the `EdicomInvoicePublisher` adapter.
+
 ```csharp
-// Application/UseCases/SubmitToEdicomUseCase.cs
-// Polly retry policy lives in the EdicomInvoicePublisher adapter, not here.
-// This use case is concerned only with interpreting the outcome.
-public sealed class SubmitToEdicomUseCase : IDispatchStep
+public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
 {
-    public string Name => "Submit";
+    var token       = await _tokenProvider.GetTokenAsync(ct);
+    var payloadHash = ComputeHash(ctx.Source);
 
-    private readonly IInvoicePublisher _publisher;
-    private readonly IDispatchStore    _store;
-    private readonly DispatchOptions   _options;
-
-    public SubmitToEdicomUseCase(
-        IInvoicePublisher publisher, IDispatchStore store, DispatchOptions options)
-        => (_publisher, _store, _options) = (publisher, store, options);
-
-    public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
+    try
     {
-        // Compute hash before marking Sent — used for mutation detection later
-        var payloadHash = ComputeHash(ctx.Source);
-        ctx.Dispatch.MarkSent(payloadHash);
+        var transactionId = await _publisher.PublishAsync(ctx.Source, token, ct);
+        ctx.Dispatch.MarkSubmitted(payloadHash, transactionId);
+        ctx.TransactionId = transactionId;
         await _store.UpdateAsync(ctx.Dispatch, ct);
-
-        try
-        {
-            ctx.PublishResult = await _publisher.PublishAsync(ctx.Source, ct);
-            return StepOutcome.Continue();
-        }
-        catch (PublisherTransientException ex) when (ctx.Dispatch.AttemptCount < _options.MaxAttempts)
-        {
-            var delay = BackoffSchedule.Next(ctx.Dispatch.AttemptCount, _options);
-            ctx.Dispatch.ScheduleRetry(DateTime.UtcNow.Add(delay));
-            await _store.UpdateAsync(ctx.Dispatch, ct);
-            return StepOutcome.Abort($"Transient failure, retrying at {ctx.Dispatch.NextAttemptAtUtc:u}: {ex.Message}");
-        }
-        catch (PublisherTransientException ex)
-        {
-            ctx.Dispatch.DeadLetter($"Max attempts ({_options.MaxAttempts}) exceeded: {ex.Message}");
-            await _store.UpdateAsync(ctx.Dispatch, ct);
-            return StepOutcome.Abort("Dead-lettered: retry budget exhausted");
-        }
-        catch (PublisherPermanentException ex)
-        {
-            ctx.Dispatch.Fail(ex.ErrorCode, ex.ErrorMessage);
-            await _store.UpdateAsync(ctx.Dispatch, ct);
-            return StepOutcome.Abort($"Permanent failure: {ex.ErrorCode}");
-        }
+        return StepOutcome.Continue();
     }
-
-    private static string ComputeHash(SourceInvoice invoice)
+    catch (PublisherTransientException ex) when (ctx.Dispatch.AttemptCount < _options.MaxAttempts)
     {
-        // SHA-256 of the canonical invoice fields
-        var bytes = Encoding.UTF8.GetBytes($"{invoice.InvoiceNumber}|{invoice.TotalAmount}|{invoice.CurrencyCode}");
-        return Convert.ToHexString(SHA256.HashData(bytes));
+        ctx.Dispatch.ScheduleRetry(DateTime.UtcNow.Add(BackoffSchedule.Next(ctx.Dispatch.AttemptCount, _options)));
+        await _store.UpdateAsync(ctx.Dispatch, ct);
+        return StepOutcome.Abort($"Transient, retry scheduled: {ex.Message}");
+    }
+    catch (PublisherTransientException ex)
+    {
+        ctx.Dispatch.DeadLetter($"Max attempts exceeded: {ex.Message}");
+        await _store.UpdateAsync(ctx.Dispatch, ct);
+        return StepOutcome.Abort("Dead-lettered");
+    }
+    catch (PublisherPermanentException ex)
+    {
+        ctx.Dispatch.Fail(ex.ErrorCode, ex.ErrorMessage);
+        await _store.UpdateAsync(ctx.Dispatch, ct);
+        return StepOutcome.Abort($"Permanent failure: {ex.ErrorCode}");
     }
 }
 ```
 
-#### Step 5 — `RecordOutcomeUseCase`
+#### Step 5 — `RecordSubmissionUseCase` (replaces `RecordOutcomeUseCase`)
+
+Records `WaitingConfirmation` and advances the watermark. Final status is resolved by webhook or reconciler — not here.
 
 ```csharp
-// Application/UseCases/RecordOutcomeUseCase.cs
-// Only reached when SubmitToEdicomUseCase returned Continue (i.e. EDICOM accepted).
-public sealed class RecordOutcomeUseCase : IDispatchStep
+public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
 {
-    public string Name => "RecordOutcome";
-
-    private readonly IDispatchStore _store;
-    private readonly IRunStateStore _runState;
-
-    public RecordOutcomeUseCase(IDispatchStore store, IRunStateStore runState)
-        => (_store, _runState) = (store, runState);
-
-    public async Task<StepOutcome> ExecuteAsync(InvoiceDispatchContext ctx, CancellationToken ct)
-    {
-        var result = ctx.PublishResult!;
-        ctx.Dispatch.Acknowledge(result.EdicomReference, result.InvoiceUuid);
-        await _store.UpdateAsync(ctx.Dispatch, ct);
-
-        // Advance the high-water mark to cover this invoice's watermark value
-        // (orchestrator calls this per-invoice; the store tracks the max seen this run)
-        await _runState.SetHighWaterMarkAsync(ctx.Source.WatermarkValue, ct);
-
-        return StepOutcome.Continue();
-    }
+    ctx.Dispatch.MarkWaitingConfirmation();
+    await _store.UpdateAsync(ctx.Dispatch, ct);
+    await _runState.SetHighWaterMarkAsync(ctx.Source.WatermarkValue, ct);
+    return StepOutcome.Continue();
 }
 ```
 
 ---
 
-### Orchestrator — `RunDispatchBatchUseCase`
+### Status Resolution Use Cases
 
-The orchestrator is the single **driving port** of the application: it is what the Azure Function calls. It composes the five steps and drives each candidate through the ordered pipeline.
+These run independently of the submission pipeline — driven by their own Azure Function triggers.
+
+#### `HandleWebhookCallbackUseCase` (Options 1, 3, 5)
 
 ```csharp
-// Application/Orchestration/RunDispatchBatchUseCase.cs
-public sealed class RunDispatchBatchUseCase
+// Called by AzureFunctionWebhookAdapter when EDICOM POSTs a callback.
+public async Task HandleAsync(WebhookPayload payload, CancellationToken ct)
 {
-    private readonly ExtractCandidatesUseCase  _extract;
-    private readonly IReadOnlyList<IDispatchStep> _pipeline;
-    private readonly ILogger<RunDispatchBatchUseCase> _logger;
-    private readonly DispatchOptions             _options;
+    var dispatch = await _store.FindByTransactionIdAsync(payload.TransactionId, ct);
+    if (dispatch is null) return; // unknown or already terminal — ignore
 
-    public RunDispatchBatchUseCase(
-        ExtractCandidatesUseCase extract,
-        IReadOnlyList<IDispatchStep> pipeline,       // DI-ordered: Claim→Validate→Submit→Record
-        ILogger<RunDispatchBatchUseCase> logger,
-        DispatchOptions options)
-        => (_extract, _pipeline, _logger, _options) = (extract, pipeline, logger, options);
+    if (payload.IsAcknowledged)
+        dispatch.Acknowledge(payload.EdicomReference);
+    else
+        dispatch.Fail(payload.ErrorCode, payload.ErrorMessage);
 
-    public async Task RunAsync(CancellationToken ct)
+    await _store.UpdateAsync(dispatch, ct);
+}
+```
+
+#### `ReconcileStatusUseCase` (all options — primary for 2/4, fallback for 1/3/5)
+
+Runs on a separate cron timer. Finds `WaitingConfirmation` rows older than the grace period (giving webhook time to arrive first), polls EDICOM, and writes terminal status.
+
+```csharp
+public async Task RunAsync(CancellationToken ct)
+{
+    var token    = await _tokenProvider.GetTokenAsync(ct);
+    var grace    = DateTime.UtcNow.AddMinutes(-_options.WebhookGraceMinutes);
+    var pending  = await _store.GetWaitingConfirmationAsync(grace, ct);
+
+    foreach (var dispatch in pending)
     {
-        var runId      = Guid.NewGuid().ToString("N");
-        var candidates = await _extract.ExecuteAsync(runId, _options, ct);
+        var result = await _statusClient.GetStatusAsync(dispatch.EdicomTransactionId!, token, ct);
 
-        _logger.LogInformation("Run {RunId}: {Count} candidate(s) to process", runId, candidates.Count);
-
-        foreach (var ctx in candidates)
+        if (result.IsTerminal)
         {
-            if (ct.IsCancellationRequested) break;
+            if (result.IsAcknowledged)
+                dispatch.Acknowledge(result.EdicomReference);
+            else
+                dispatch.Fail(result.ErrorCode, result.ErrorMessage);
 
-            foreach (var step in _pipeline)
-            {
-                var outcome = await step.ExecuteAsync(ctx, ct);
-
-                if (outcome.Kind == StepOutcomeKind.Skip)
-                {
-                    _logger.LogDebug("{Step} skipped {Invoice}: {Reason}",
-                        step.Name, ctx.Source.InvoiceNumber, outcome.Reason);
-                    break;
-                }
-
-                if (outcome.Kind == StepOutcomeKind.Abort)
-                {
-                    _logger.LogWarning("{Step} aborted {Invoice}: {Reason}",
-                        step.Name, ctx.Source.InvoiceNumber, outcome.Reason);
-                    break;
-                }
-            }
+            await _store.UpdateAsync(dispatch, ct);
         }
-
-        _logger.LogInformation("Run {RunId} complete", runId);
     }
 }
 ```
 
-The orchestrator is deliberately thin: it does not contain business logic. All decisions live inside the steps.
+> For Options 2 and 4 (polling-only), set `WebhookGraceMinutes = 0` so the reconciler picks up rows immediately. For Options 1, 3, 5 (webhook + fallback), set it to e.g. 10–30 minutes so webhooks have time to arrive first.
+
+---
+
+### Orchestrators
+
+#### `RunDispatchBatchUseCase` — Per-Invoice Sequential (Options 1, 2)
+
+Unchanged in structure — loops through candidates one by one through the pipeline.
+
+#### `RunDispatchBatchBatchUseCase` — Batch Fan-Out (Options 3, 4)
+
+Same steps, but reads up to `BatchSize` candidates at once and submits them concurrently with a semaphore to respect EDICOM rate limits.
+
+```csharp
+public async Task RunAsync(CancellationToken ct)
+{
+    var runId      = Guid.NewGuid().ToString("N");
+    var candidates = await _extract.ExecuteAsync(runId, _options, ct);
+    var semaphore  = new SemaphoreSlim(_options.MaxConcurrentSubmits); // e.g. 10
+
+    var tasks = candidates.Select(async ctx =>
+    {
+        await semaphore.WaitAsync(ct);
+        try { await RunPipelineAsync(ctx, ct); }
+        finally { semaphore.Release(); }
+    });
+
+    await Task.WhenAll(tasks);
+}
+```
+
+#### `PublishCandidatesToQueueUseCase` — Queue Poller (Option 5)
+
+Runs on the same timer as the batch orchestrators but only publishes to the queue — it does not submit to EDICOM.
+
+```csharp
+public async Task RunAsync(CancellationToken ct)
+{
+    var watermark  = await _runState.GetHighWaterMarkAsync(ct);
+    var candidates = await _source.GetCandidatesAsync(watermark, ct);
+
+    // Claim all candidates atomically in the source DB before publishing
+    await _sourceInvoiceRepository.MarkClaimedAsync(candidates, ct);
+    await _queuePublisher.PublishCandidatesBatchAsync(candidates, ct);
+}
+```
+
+The **queue consumer** (`AzureFunctionQueueConsumerAdapter`) drives either `RunDispatchBatchUseCase` (5a, per-invoice) or `RunDispatchBatchBatchUseCase` (5b, batch) — same steps, different trigger.
 
 ---
 
 ## Infrastructure Layer
 
+### `EdicomTokenProvider` — OAuth 2.0 Token Cache
+
+```csharp
+// Infrastructure/Edicom/EdicomTokenProvider.cs
+public sealed class EdicomTokenProvider : IEdicomTokenProvider
+{
+    private string?  _cachedToken;
+    private DateTime _expiresAt = DateTime.MinValue;
+
+    public async Task<string> GetTokenAsync(CancellationToken ct)
+    {
+        if (_cachedToken is not null && DateTime.UtcNow < _expiresAt.AddSeconds(-30))
+            return _cachedToken;
+
+        var response = await _http.PostAsync("https://accounts.edicomgroup.com/token",
+            new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["grant_type"] = "password",
+                ["username"]   = _options.Username,
+                ["password"]   = _options.Password,
+                ["scope"]      = "openid",
+            }), ct);
+
+        var json = await response.Content.ReadFromJsonAsync<TokenResponse>(ct);
+        _cachedToken = json!.AccessToken;
+        _expiresAt   = DateTime.UtcNow.AddSeconds(json.ExpiresIn);
+        return _cachedToken;
+    }
+}
+```
+
 ### `EdicomInvoicePublisher` — Driven Adapter
 
-This adapter owns: the HTTP call, Polly policy, payload mapping, and EDICOM error taxonomy. The application layer never references this class directly.
+Accepts a `bearerToken` parameter — the token is owned by `IEdicomTokenProvider`, not re-fetched here. Polly retry + circuit breaker unchanged.
+
+### `EdicomStatusClient` — Driven Adapter
 
 ```csharp
-// Infrastructure/Edicom/EdicomInvoicePublisher.cs
-public sealed class EdicomInvoicePublisher : IInvoicePublisher
+// Infrastructure/Edicom/EdicomStatusClient.cs
+public sealed class EdicomStatusClient : IEdicomStatusClient
 {
-    private readonly HttpClient       _http;
-    private readonly IPayloadMapper   _mapper;
-    private readonly ResiliencePipeline<HttpResponseMessage> _policy;
-
-    public EdicomInvoicePublisher(HttpClient http, IPayloadMapper mapper, EdicomOptions options)
+    public async Task<EdicomStatusResult> GetStatusAsync(
+        string transactionId, string bearerToken, CancellationToken ct)
     {
-        _http   = http;
-        _mapper = mapper;
-        _policy = BuildPolicy(options);
-    }
+        _http.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", bearerToken);
 
-    public async Task<PublishResult> PublishAsync(SourceInvoice invoice, CancellationToken ct)
-    {
-        // Mapping from domain object → EDICOM AE PINT/UBL payload lives here (ACL)
-        var payload  = await _mapper.MapAsync(invoice, ct);
-        var response = await _policy.ExecuteAsync(
-            async token => await _http.PostAsJsonAsync("/invoices", payload, token), ct);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync(ct);
-            throw ClassifyError(response.StatusCode, body);
-        }
-
-        var result = await response.Content.ReadFromJsonAsync<EdicomSubmitResponse>(ct);
-        return new PublishResult(result!.TransactionId, result.InvoiceUuid);
-    }
-
-    private static ResiliencePipeline<HttpResponseMessage> BuildPolicy(EdicomOptions o) =>
-        new ResiliencePipelineBuilder<HttpResponseMessage>()
-            .AddRetry(new RetryStrategyOptions<HttpResponseMessage>
-            {
-                ShouldHandle      = args => ValueTask.FromResult(IsTransient(args.Outcome)),
-                MaxRetryAttempts  = o.InRunMaxRetries,   // default: 3
-                BackoffType       = DelayBackoffType.Exponential,
-                UseJitter         = true,
-                Delay             = TimeSpan.FromSeconds(o.RetryBaseSeconds), // default: 2
-            })
-            .AddCircuitBreaker(new CircuitBreakerStrategyOptions<HttpResponseMessage>
-            {
-                FailureRatio       = 0.5,
-                SamplingDuration   = TimeSpan.FromSeconds(30),
-                MinimumThroughput  = 5,
-                BreakDuration      = TimeSpan.FromSeconds(o.CircuitBreakerBreakSeconds), // default: 60
-            })
-            .Build();
-
-    private static bool IsTransient(Outcome<HttpResponseMessage> outcome)
-    {
-        if (outcome.Exception is HttpRequestException) return true;
-        if (outcome.Result is { } r)
-            return r.StatusCode is HttpStatusCode.TooManyRequests
-                or HttpStatusCode.BadGateway
-                or HttpStatusCode.ServiceUnavailable
-                or HttpStatusCode.GatewayTimeout;
-        return false;
-    }
-
-    // Maps EDICOM HTTP errors to typed exceptions the application can pattern-match
-    private static Exception ClassifyError(HttpStatusCode status, string body)
-    {
-        return status switch
-        {
-            HttpStatusCode.BadRequest      => new PublisherPermanentException("VALIDATION_ERROR", body),
-            HttpStatusCode.UnprocessableEntity => new PublisherPermanentException("BUSINESS_REJECTION", body),
-            HttpStatusCode.Unauthorized    => new PublisherPermanentException("AUTH_ERROR", body),
-            HttpStatusCode.Forbidden       => new PublisherPermanentException("PERMISSION_DENIED", body),
-            // Anything else: treated as transient once, then escalates in the use case
-            _                              => new PublisherTransientException(body),
-        };
+        var response = await _http.GetAsync($"/messages?transactionId={transactionId}", ct);
+        // parse and return EdicomStatusResult
     }
 }
 ```
 
-> **ACL callout.** `EdicomPayloadMapper` (which implements `IPayloadMapper`) is the Anti-Corruption Layer: it translates from the domain's `SourceInvoice` to EDICOM's AE PINT / UBL XML schema. If EDICOM changes their API, only this class changes. The domain and application layers are unaffected.
-
-### `AzureFunctionTimerAdapter` — Driving Adapter
+### `AzureFunctionWebhookAdapter` — Driving Adapter (Options 1, 3, 5)
 
 ```csharp
-// Infrastructure/Host/AzureFunctionTimerAdapter.cs
-public class InvoiceIntegratorTimerFunction
+// Infrastructure/Host/AzureFunctionWebhookAdapter.cs
+public class InvoiceWebhookFunction
 {
-    private readonly RunDispatchBatchUseCase _batch;
-    public InvoiceIntegratorTimerFunction(RunDispatchBatchUseCase batch) => _batch = batch;
+    private readonly HandleWebhookCallbackUseCase _handler;
 
-    [Function("InvoiceIntegratorTimer")]
-    public async Task Run(
-        [TimerTrigger("%ScheduleCron%")] TimerInfo timer,
+    [Function("EdicomWebhook")]
+    public async Task<IActionResult> Run(
+        [HttpTrigger(AuthorizationLevel.Function, "post", Route = "edicom/webhook")] HttpRequest req,
         FunctionContext context)
     {
-        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(8)); // Function timeout guard
-        await _batch.RunAsync(cts.Token);
+        // Validate HMAC / shared secret on inbound request
+        var payload = await req.ReadFromJsonAsync<WebhookPayload>();
+        await _handler.HandleAsync(payload!, context.CancellationToken);
+        return new OkResult();
     }
 }
 ```
 
-### Composition Root
+### `AzureFunctionReconcilerAdapter` — Driving Adapter (all options)
 
 ```csharp
-// Infrastructure/Host/DependencyInjection.cs
-public static IServiceCollection AddInvoiceIntegrator(
-    this IServiceCollection services, IConfiguration config)
+// Infrastructure/Host/AzureFunctionReconcilerAdapter.cs
+public class InvoiceReconcilerFunction
 {
-    // Options
-    services.Configure<DispatchOptions>(config.GetSection("Dispatch"));
-    services.Configure<EdicomOptions>(config.GetSection("Edicom"));
+    private readonly ReconcileStatusUseCase _reconciler;
 
-    // Domain / Application
-    services.AddSingleton<ExtractCandidatesUseCase>();
-
-    // Pipeline steps — order here IS the execution order
-    services.AddSingleton<IDispatchStep, ClaimInvoiceUseCase>();
-    services.AddSingleton<IDispatchStep, ValidateInvoiceUseCase>();
-    services.AddSingleton<IDispatchStep, SubmitToEdicomUseCase>();
-    services.AddSingleton<IDispatchStep, RecordOutcomeUseCase>();
-
-    services.AddSingleton<RunDispatchBatchUseCase>(sp =>
-        new RunDispatchBatchUseCase(
-            sp.GetRequiredService<ExtractCandidatesUseCase>(),
-            sp.GetRequiredService<IEnumerable<IDispatchStep>>().ToList().AsReadOnly(),
-            sp.GetRequiredService<ILogger<RunDispatchBatchUseCase>>(),
-            sp.GetRequiredService<IOptions<DispatchOptions>>().Value));
-
-    // Driven ports → adapters
-    services.AddScoped<ISourceInvoiceRepository, SqlSourceInvoiceRepository>();
-    services.AddScoped<IDispatchStore,            SqlDispatchStore>();
-    services.AddScoped<IRunStateStore,            SqlRunStateStore>();
-    services.AddScoped<IPayloadMapper,            EdicomPayloadMapper>();
-
-    // EDICOM HTTP client with base address + auth header
-    services.AddHttpClient<IInvoicePublisher, EdicomInvoicePublisher>(client =>
+    [Function("InvoiceStatusReconciler")]
+    public async Task Run(
+        [TimerTrigger("%ReconcilerCron%")] TimerInfo timer,
+        FunctionContext context)
     {
-        client.BaseAddress = new Uri(config["Edicom:BaseUrl"]!);
-        client.DefaultRequestHeaders.Add("X-Api-Key", config["Edicom:ApiKey"]);
-    });
-
-    return services;
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        await _reconciler.RunAsync(cts.Token);
+    }
 }
 ```
 
 ---
 
-## Configuration (`DispatchOptions`)
+## End-to-End Flows
+
+### Submission Flow (all options)
+
+```mermaid
+sequenceDiagram
+    participant TRIG as Timer / Queue Consumer
+    participant ORC  as Orchestrator
+    participant EXT  as ExtractCandidates
+    participant CLM  as ClaimInvoice
+    participant VAL  as ValidateInvoice
+    participant SUB  as SubmitToEdicom
+    participant REC  as RecordSubmission
+    participant TOK  as EdicomTokenProvider
+    participant EP   as EdicomInvoicePublisher
+    participant DS   as SqlDispatchStore
+
+    TRIG ->> ORC: RunAsync(ct)
+    ORC  ->> EXT: ExecuteAsync(runId, options, ct)
+    EXT  -->> ORC: List<InvoiceDispatchContext>
+
+    loop for each candidate (sequential) or Task.WhenAll (batch)
+        ORC ->> CLM: ExecuteAsync → TryClaimAsync
+        ORC ->> VAL: ExecuteAsync → ValidateAsync
+        ORC ->> SUB: ExecuteAsync
+        SUB ->> TOK: GetTokenAsync (cached)
+        SUB ->> EP:  PublishAsync → POST /publish
+        EP  -->> SUB: transactionId
+        SUB ->> DS:  UpdateAsync (Submitted)
+        ORC ->> REC: ExecuteAsync
+        REC ->> DS:  UpdateAsync (WaitingConfirmation)
+        REC ->> DS:  SetHighWaterMarkAsync
+    end
+```
+
+### Status Resolution — Webhook Path (Options 1, 3, 5)
+
+```mermaid
+sequenceDiagram
+    participant EDICOM as EDICOM iPaaS
+    participant WHK   as WebhookFunction
+    participant UC    as HandleWebhookCallbackUseCase
+    participant DS    as SqlDispatchStore
+
+    EDICOM ->> WHK: POST /edicom/webhook (transactionId, status)
+    WHK    ->> UC:  HandleAsync(payload)
+    UC     ->> DS:  FindByTransactionIdAsync
+    DS     -->> UC: InvoiceDispatch (WaitingConfirmation)
+    UC     ->> DS:  UpdateAsync (Acknowledged | Failed)
+```
+
+### Status Resolution — Reconciler Path (all options)
+
+```mermaid
+sequenceDiagram
+    participant RSCHED as Reconciler Timer
+    participant RUC   as ReconcileStatusUseCase
+    participant TOK   as EdicomTokenProvider
+    participant SC    as EdicomStatusClient
+    participant DS    as SqlDispatchStore
+
+    RSCHED ->> RUC: RunAsync(ct)
+    RUC    ->> DS:  GetWaitingConfirmationAsync(graceThreshold)
+    DS     -->> RUC: List<InvoiceDispatch>
+    RUC    ->> TOK: GetTokenAsync (cached)
+    loop for each WaitingConfirmation row
+        RUC ->> SC:  GetStatusAsync(transactionId, token)
+        SC  -->> RUC: EdicomStatusResult
+        RUC ->> DS:  UpdateAsync (Acknowledged | Failed)
+    end
+```
+
+---
+
+## Operating Mode Selection
+
+The three dimensions are wired at the composition root — no code changes in domain or application:
+
+| Option | Orchestrator | Queue adapters | Webhook function | Reconciler grace |
+|---|---|---|---|---|
+| 1 — Per-invoice + webhook | `RunDispatchBatchUseCase` | None | Registered | > 0 min |
+| 2 — Per-invoice + poll | `RunDispatchBatchUseCase` | None | Not registered | 0 min |
+| 3 — Batch + webhook | `RunDispatchBatchBatchUseCase` | None | Registered | > 0 min |
+| 4 — Batch + poll | `RunDispatchBatchBatchUseCase` | None | Not registered | 0 min |
+| 5a — Queue per-invoice + webhook | `PublishCandidatesToQueueUseCase` (timer) + `RunDispatchBatchUseCase` (queue) | `ServiceBusQueuePublisher` | Registered | > 0 min |
+| 5b — Queue batch + webhook | `PublishCandidatesToQueueUseCase` (timer) + `RunDispatchBatchBatchUseCase` (queue) | `ServiceBusQueuePublisher` | Registered | > 0 min |
+
+---
+
+## Configuration
 
 ```csharp
 public sealed class DispatchOptions
@@ -758,53 +694,10 @@ public sealed class DispatchOptions
     public int    RetryBaseSeconds         { get; init; } = 2;
     public int    InRunMaxRetries          { get; init; } = 3;
     public int    CircuitBreakerBreakSec   { get; init; } = 60;
+    public int    MaxConcurrentSubmits     { get; init; } = 10;   // batch options
+    public int    BatchSize                { get; init; } = 100;  // batch options
+    public int    WebhookGraceMinutes      { get; init; } = 0;    // 0 = polling only; >0 = webhook + fallback
 }
-```
-
----
-
-## End-to-End Sequence
-
-```mermaid
-sequenceDiagram
-    participant FN  as AzureFunctionTimerAdapter
-    participant ORC as RunDispatchBatchUseCase
-    participant EXT as ExtractCandidatesUseCase
-    participant CLM as ClaimInvoiceUseCase
-    participant VAL as ValidateInvoiceUseCase
-    participant SUB as SubmitToEdicomUseCase
-    participant REC as RecordOutcomeUseCase
-    participant SRC as SqlSourceInvoiceRepository
-    participant DS  as SqlDispatchStore
-    participant EP  as EdicomInvoicePublisher
-
-    FN  ->> ORC: RunAsync(ct)
-    ORC ->> EXT: ExecuteAsync(runId, options, ct)
-    EXT ->> SRC: GetCandidatesAsync(watermark, ct)
-    EXT ->> DS:  GetDueForProcessingAsync(visTimeout, ct)
-    EXT -->> ORC: List<InvoiceDispatchContext>
-
-    loop for each candidate
-        ORC ->> CLM: ExecuteAsync(ctx, ct)
-        CLM ->> DS:  TryClaimAsync(invoiceNumber, runId, ct)
-        CLM -->> ORC: Continue | Skip
-
-        ORC ->> VAL: ExecuteAsync(ctx, ct)
-        VAL -->> ORC: Continue | Abort(Failed)
-
-        ORC ->> SUB: ExecuteAsync(ctx, ct)
-        SUB ->> EP:  PublishAsync(source, ct)
-        EP  -->> SUB: PublishResult | Exception
-        SUB ->> DS:  UpdateAsync(Sent → Retryable|Failed|DeadLettered)
-        SUB -->> ORC: Continue | Abort
-
-        ORC ->> REC: ExecuteAsync(ctx, ct)
-        REC ->> DS:  UpdateAsync(Sent → Acknowledged)
-        REC ->> DS:  SetHighWaterMarkAsync(watermarkValue, ct)
-        REC -->> ORC: Continue
-    end
-
-    ORC -->> FN: (done)
 ```
 
 ---
@@ -813,14 +706,18 @@ sequenceDiagram
 
 | Layer | What to test | How |
 |---|---|---|
-| **Domain** | State machine — allowed/disallowed transitions, `Transition` enforces validity | Pure unit tests, no mocks |
-| **Each step (use case)** | Happy path + every `Skip`/`Abort` branch | Unit tests with mocked ports |
-| **`RunDispatchBatchUseCase`** | Step ordering, break-on-Skip/Abort, full batch flow | Unit tests with fake step list |
-| **`EdicomInvoicePublisher`** | Polly retry fires on transient, circuit breaker trips, error classification | Integration tests against WireMock / `MockHttpMessageHandler` |
-| **`SqlDispatchStore`** | `TryClaimAsync` race (two parallel calls, one wins), `UNIQUE(InvoiceNumber)` rejects duplicate | Integration tests against a real SQL Server (Testcontainers or LocalDB) |
-| **Architecture** | No Application class references Infrastructure class | NetArchTest rule |
-| **Architecture** | `ISourceInvoiceRepository` exposes only read methods (no `Save`/`Update`) | NetArchTest rule |
-| **Concurrency** | Two parallel runs over same candidate set produce zero duplicate EDICOM submissions | End-to-end test with two parallel `RunAsync` calls |
+| **Domain** | All allowed/disallowed state transitions including `WaitingConfirmation` paths | Pure unit tests |
+| **Each step** | Happy path + every `Skip`/`Abort` branch | Unit tests with mocked ports |
+| **`RunDispatchBatchUseCase`** | Step ordering, break-on-Skip/Abort | Unit tests with fake step list |
+| **`RunDispatchBatchBatchUseCase`** | Concurrency, semaphore limit respected | Unit tests with delay-injected fake publisher |
+| **`HandleWebhookCallbackUseCase`** | Acknowledged + Failed branches, unknown transactionId no-op | Unit tests |
+| **`ReconcileStatusUseCase`** | Grace period filter, terminal write, non-terminal no-op | Unit tests |
+| **`EdicomTokenProvider`** | Cache hit, proactive refresh, expired token | Unit tests with fake HTTP |
+| **`EdicomInvoicePublisher`** | Polly retry on transient, circuit breaker trips, error classification | Integration tests vs WireMock |
+| **`SqlDispatchStore`** | `TryClaimAsync` race, `UNIQUE(InvoiceNumber)` rejects duplicate | Integration tests vs LocalDB / Testcontainers |
+| **Architecture** | Application never references Infrastructure | NetArchTest |
+| **Architecture** | `ISourceInvoiceRepository` has no write methods | NetArchTest |
+| **Concurrency** | Two parallel runs on same candidate set → zero duplicate EDICOM submits | End-to-end test |
 
 ---
 
@@ -828,7 +725,10 @@ sequenceDiagram
 
 1. **Domain never imports infrastructure.** `InvoiceDispatch` and `SourceInvoice` have zero NuGet references beyond BCL.
 2. **Steps are the only place state transitions happen.** No `dispatch.Status = ...` outside a `Transition(...)` call.
-3. **Pipeline order is declared once** — in the DI composition root. Swapping or inserting a step is a one-line change.
-4. **The ACL is `EdicomPayloadMapper`.** All knowledge of AE PINT / UBL XML lives there. Application steps pass `SourceInvoice`, never an EDICOM-specific type.
-5. **`IInvoicePublisher` throws typed exceptions** (`PublisherTransientException` / `PublisherPermanentException`), never raw `HttpRequestException`. The application layer pattern-matches on these — never on HTTP status codes.
-6. **No writes to the source DB.** `ISourceInvoiceRepository` has only read methods. Enforced by a NetArchTest rule.
+3. **Token is never fetched per-invoice.** `IEdicomTokenProvider` is called once per run and cached; all submits within a run share the same token.
+4. **`WaitingConfirmation` is the normal post-submit state.** Steps never write `Acknowledged` directly — only the `WebhookHandler` or `Reconciler` do.
+5. **Pipeline order is declared once** — in the DI composition root.
+6. **The ACL is `EdicomPayloadMapper`.** All knowledge of AE PINT / UBL XML lives there.
+7. **`IInvoicePublisher` throws typed exceptions**, never raw `HttpRequestException`.
+8. **No writes to the source DB from the processor.** The source DB claim (`MarkClaimed`) is only issued from the poller/extractor, never from within pipeline steps.
+9. **Operating mode is a composition root concern.** Switching Options 1–5 requires only DI wiring changes, never domain or application code changes.
