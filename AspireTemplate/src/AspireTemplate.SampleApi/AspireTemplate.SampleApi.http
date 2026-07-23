@@ -1,6 +1,0 @@
-@AspireTemplate.SampleApi_HostAddress = http://localhost:5062
-
-GET {{AspireTemplate.SampleApi_HostAddress}}/health
-Accept: application/json
-
-###

@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:edicomgroup.com)",
+      "WebSearch",
+      "WebFetch(domain:www.tax.gov.ae)",
+      "WebFetch(domain:docs.peppol.eu)",
+      "WebFetch(domain:www.oasis-open.org)",
+      "WebFetch(domain:groups.oasis-open.org)",
+      "WebFetch(domain:en.wikipedia.org)",
+      "WebFetch(domain:docs.oasis-open.org)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.unece.org)",
+      "WebFetch(domain:peppol.eu)",
+      "WebFetch(domain:ipaas-docs.edicomgroup.com)"
+    ]
+  }
+}
