@@ -345,6 +345,163 @@ UBL is XML-based and human-readable. It's increasingly used alongside or instead
 | **For UAE e-Invoice** | Not typical             | Not typical             | **Preferred (PEPPOL AE PINT basis)** |
 | **EDICOM Support**    | Likely                  | Likely                  | **Most likely (PEPPOL profile)**     |
 
+---
+
+## EDICOM iPaaS API Reference
+
+Below are the endpoints used at each step of the pipeline. All endpoints require an OAuth 2.0 bearer token (acquired via the token endpoint). Reference: [EDICOM iPaaS Docs](https://ipaas-docs.edicomgroup.com/docs/openapi/eipaas-server-api/)
+
+### Step 1: Authenticate
+
+**Endpoint:** `POST https://accounts.edicomgroup.com/token`
+
+**Purpose:** Acquire an OAuth 2.0 access token for subsequent API calls.
+
+**Request:**
+
+```
+POST /token HTTP/1.1
+Host: accounts.edicomgroup.com
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=password
+&username={username}
+&password={password}
+&scope=openid
+```
+
+**Response:**
+
+```json
+{
+  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
+  "token_type": "Bearer",
+  "expires_in": 3600
+}
+```
+
+**Processor action:** Cache the token and refresh proactively ~30 seconds before expiry. Do not request a new token per invoice.
+
+---
+
+### Step 2: Submit Invoice
+
+**Endpoint:** `POST /publish`
+
+**Purpose:** Submit a single invoice document to EDICOM for processing.
+
+**Request headers:**
+
+```
+Authorization: Bearer {access_token}
+Content-Type: application/json
+```
+
+**Request body** (inferred from integration pattern):
+
+```json
+{
+  "document": {
+    "invoiceNumber": "INV-12345",
+    "invoiceDate": "2026-07-22",
+    "amount": 1500.00,
+    "currency": "USD",
+    "... other invoice fields ..."
+  }
+}
+```
+
+**Response** (expected):
+
+```json
+{
+  "transactionId": "TXN-abc123def456",
+  "status": "submitted",
+  "timestamp": "2026-07-22T10:30:00Z"
+}
+```
+
+**Processor action:** Extract `transactionId`, update `invint.InvoiceIntegration` with `Status = WaitingConfirmation`.
+
+> **Note:** EDICOM does not expose a batch endpoint. Submit invoices individually or concurrently under a single token (see Options 3/4/5b for concurrent patterns).
+
+---
+
+### Step 3: Receive Status — Webhook (Option 1)
+
+**Endpoint:** `POST {your-webhook-url}` (inbound from EDICOM)
+
+**Purpose:** EDICOM pushes the final status of an invoice when processing completes.
+
+**Inbound request body** (expected):
+
+```json
+{
+  "transactionId": "TXN-abc123def456",
+  "invoiceNumber": "INV-12345",
+  "status": "acknowledged|rejected|failed",
+  "edicomReference": "REF-xyz789",
+  "errorCode": "ERR_001",
+  "errorMessage": "Invalid amount"
+}
+```
+
+**Webhook handler action:**
+
+1. Validate the request is from EDICOM (HMAC signature, IP allowlist, or bearer token).
+2. Query `invint.InvoiceIntegration` for the `transactionId`.
+3. Update `Status = Acknowledged` or `Failed`, record `EdicomReference` if present.
+4. Return HTTP 200 to confirm delivery.
+
+> **Requirements:** Publicly reachable HTTPS endpoint. Idempotent — duplicate callbacks for the same transactionId must not create duplicate records.
+
+---
+
+### Step 4: Poll Status — Reconciler (All Options)
+
+**Endpoint:** `GET /messages`
+
+**Purpose:** Query the status of submitted invoices. Acts as the primary mechanism for polling-only options (2, 4) or fallback safety net for webhook options (1, 3, 5).
+
+**Request:**
+
+```
+GET /messages?transactionId={transactionId}&status=*
+Authorization: Bearer {access_token}
+```
+
+**Response** (expected):
+
+```json
+{
+  "messages": [
+    {
+      "transactionId": "TXN-abc123def456",
+      "documentId": "DOC-12345",
+      "status": "acknowledged|pending|failed",
+      "edicomReference": "REF-xyz789",
+      "errorCode": "ERR_001",
+      "errorMessage": "Invalid amount",
+      "processedAt": "2026-07-22T10:35:00Z"
+    }
+  ]
+}
+```
+
+**Reconciler action:**
+
+1. Query `invint.InvoiceIntegration` for `Status = WaitingConfirmation AND SubmittedAt < NOW() - @GraceMinutes`.
+2. For each `transactionId`, call `GET /messages`.
+3. If status is `acknowledged` → update the row to `Acknowledged`.
+4. If status is `failed` → update the row to `Failed` with error code/message.
+5. If still `pending` → increment `ReconcileAttempts`; if >= max, write `Failed` + alert.
+
+**Polling interval:** 5–15 minutes (configurable per option).
+
+---
+
+---
+
 ## References
 
 - **X12 Standards:** [ASC X12 — https://www.x12.org/](https://www.x12.org/)

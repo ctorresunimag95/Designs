@@ -194,6 +194,7 @@ sequenceDiagram
   participant Edicom as EDICOM iPaaS
   participant WH as Webhook Handler
   participant IntDB as invint.InvoiceIntegration
+  participant SrcDB as Source DB
 
   Edicom->>WH: POST /webhook {transactionId, status, edicomReference, errorCode?}
   WH->>WH: verify sender auth (HMAC / IP allowlist)
@@ -201,8 +202,12 @@ sequenceDiagram
   IntDB-->>WH: row found (WaitingConfirmation)
   WH->>IntDB: UPDATE Status = Acknowledged / Failed
   IntDB-->>WH: updated
+  WH->>SrcDB: Update Source DB with result status
+  SrcDB-->>WH: updated
   WH-->>Edicom: 200 OK
 ```
+
+<br>
 
 #### 4b. Polling reconciler (fallback)
 
@@ -238,17 +243,17 @@ sequenceDiagram
 
 Each layer of the pipeline can fail independently. The table below maps failure modes to their recovery mechanism.
 
-| Failure                                        | Recovery mechanism                                                  |
-| ---------------------------------------------- | ------------------------------------------------------------------- |
-| Transient EDICOM submit error (5xx / timeout)  | Polly retry with exponential backoff                                |
-| EDICOM persistently unavailable                | Circuit breaker → abort run → stale claim recovery                  |
-| Processor crash after claim, before submit     | Stale claim reset in next processor run                             |
-| Processor crash after submit, before record    | Message redelivered; idempotent state transition prevents duplicate |
-| Webhook callback never arrives                 | Polling reconciler fires after `GraceMinutes`                       |
-| WaitingConfirmation never resolves             | Reconciler max-attempts → mark `Failed` + alert                     |
-| Token endpoint unavailable                     | Retry token fetch → abort run → stale claim recovery                |
-| Partial batch failure                          | Per-invoice tracking; failed invoices recover via stale claim reset |
-| Queue message fails repeatedly                 | Dead-letter queue (DLQ) → alert on DLQ depth                        |
+| Failure                                       | Recovery mechanism                                                  |
+| --------------------------------------------- | ------------------------------------------------------------------- |
+| Transient EDICOM submit error (5xx / timeout) | Polly retry with exponential backoff                                |
+| EDICOM persistently unavailable               | Circuit breaker → abort run → stale claim recovery                  |
+| Processor crash after claim, before submit    | Stale claim reset in next processor run                             |
+| Processor crash after submit, before record   | Message redelivered; idempotent state transition prevents duplicate |
+| Webhook callback never arrives                | Polling reconciler fires after `GraceMinutes`                       |
+| WaitingConfirmation never resolves            | Reconciler max-attempts → mark `Failed` + alert                     |
+| Token endpoint unavailable                    | Retry token fetch → abort run → stale claim recovery                |
+| Partial batch failure                         | Per-invoice tracking; failed invoices recover via stale claim reset |
+| Queue message fails repeatedly                | Dead-letter queue (DLQ) → alert on DLQ depth                        |
 
 ---
 
@@ -268,207 +273,93 @@ Do **not** retry HTTP 400 / 422 — these indicate a malformed payload. Log the 
 
 ---
 
-### Stale claim recovery
+### Stale claim recovery — behavior with once-a-day trigger
 
-The claim query always includes a timeout window so crashed or abandoned claims are automatically recycled:
+> **Important:** The stale claim reset is embedded in the processor's claim query — it only runs when the processor consumes a message from the queue. With a once-a-day cron trigger, the processor goes idle once the queue is empty. There is no background process waking the processor up every 30 minutes.
+
+**What actually happens when EDICOM is down:**
+
+```
+DAY 1 — Cron fires (08:00, once)
+─────────────────────────────────────────────────────────
+  08:00  Cron fires → discovers INV-001 → UPSERT Status = Pending
+         └─ Publishes INV-001 to queue
+
+  08:02  Processor wakes up (queue message received)
+         └─ Claim query runs → Status = Claimed, ClaimedAt = 08:02
+         └─ Gathers data, builds payload
+         └─ POST /publish → EDICOM DOWN
+            ├─ Retry 1 (1s)  → fails
+            ├─ Retry 2 (2s)  → fails
+            ├─ Retry 3 (4s)  → fails
+            └─ Circuit breaker opens → processor aborts
+               Queue empty → processor goes idle
+
+  INV-001 stays: Status = Claimed, ClaimedAt = 08:02
+  Queue empty → processor idle for the rest of the day
+
+─────────────────────────────────────────────────────────
+DAY 2 — Cron fires (08:00, once)
+─────────────────────────────────────────────────────────
+  08:00  Cron fires → queries Source DB
+         └─ Finds INV-001 (still unprocessed in Source DB) + INV-002 (new)
+         └─ UPSERT INV-001 → resets Status = Pending   ← cron drives the retry, not the processor
+         └─ UPSERT INV-002 → Status = Pending
+         └─ Publishes INV-001 to queue
+         └─ Publishes INV-002 to queue
+
+  08:02  Processor wakes up (INV-001 message received)
+         └─ Atomic claim → Status = Claimed
+         └─ POST /publish → EDICOM still down → fails
+         └─ Queue still has INV-002
+
+  08:02  Processor wakes up (INV-002 message received)
+         └─ Atomic claim → Status = Claimed
+         └─ POST /publish → EDICOM still down → fails
+         └─ Queue empty → processor idle again
+```
+
+> **Result:** Stuck invoices are retried the next day when new invoices arrive and wake the processor. If no new invoices come in, the stuck invoice waits indefinitely.
+
+---
+
+### Options to improve observability and recovery
+
+**Option A — Housekeeping cron (operational)**
+
+Add a lightweight scheduled job (every 30 min) that re-publishes stale `Claimed` rows back to the queue independently of the daily trigger. This keeps retry cadence at 30 min regardless of whether new invoices arrive.
+
+```
+Every 30 min:
+  Query: Status = Claimed AND ClaimedAt < NOW() - ClaimTimeoutMinutes
+         AND StaleResetCount < MaxStaleResets
+  For each stale row:
+    └─ Increment StaleResetCount
+    └─ Reset Status = Pending
+    └─ Re-publish invoiceNumber to queue
+  If StaleResetCount >= MaxStaleResets:
+    └─ Status = Blocked
+    └─ Trigger alert
+```
+
+**Option B — Dashboard / monitoring (observability)**
+
+Without adding a new cron, expose stuck invoices via a query or monitoring alert so ops can act manually:
 
 ```sql
-UPDATE invint.InvoiceIntegration
-SET    Status = 'Claimed', ClaimedAt = GETUTCDATE()
-OUTPUT inserted.*
-WHERE  Status = 'Pending'
-   OR (Status = 'Claimed' AND ClaimedAt < DATEADD(MINUTE, -@ClaimTimeoutMinutes, GETUTCDATE()))
+-- Invoices stuck in Claimed with multiple reset attempts
+SELECT InvoiceNumber, ClaimedAt, StaleResetCount, FailureReason
+FROM   invint.InvoiceIntegration
+WHERE  Status = 'Claimed'
+  AND  StaleResetCount >= 2
+ORDER  BY ClaimedAt ASC
 ```
 
-`ClaimTimeoutMinutes` (default: 30) must exceed the worst-case run duration. A failed submit for invoice _k_ does not roll back claims for _k+1 … N_ — each invoice is tracked independently.
+Surface this in a dashboard or alert (e.g. alert when any row has `StaleResetCount >= 2`). Ops can investigate EDICOM health and manually reset rows to `Pending` when the service recovers.
 
+> **Recommendation:** Option B has zero infrastructure cost and covers the observable failure. Add Option A only if next-day retry violates your SLA.
 ---
 
-### WaitingConfirmation timeout — reconciler
-
-See sequence diagram 4b for the full flow. Key configuration parameters:
-
-- `GraceMinutes` — how long to wait before polling begins; must exceed EDICOM's typical callback latency (e.g., 15 min).
-- `MaxReconcilerAttempts` (default: 10) — after this many polling cycles with no terminal status, the row is written to `Failed` with reason `MaxAttemptsExceeded` and an alert is triggered.
-
----
-
-### Token acquisition failure
-
-Token fetch is retried up to 3 times with a short backoff before the processor run aborts. If the token endpoint is unavailable, claimed rows are left as `Claimed` and recovered by the stale claim reset on the next successful run. Alert on repeated token failures — this indicates an auth configuration issue, not a transient blip.
-
----
-
-### Missed webhook delivery
-
-EDICOM may not retry a webhook if the endpoint is unreachable or returns non-2xx. The polling reconciler (sequence diagram 4b) is the safety net that covers this case. The webhook handler must be idempotent — a duplicate callback for the same `transactionId` must not produce a duplicate state transition.
-
----
-
-### Dead-letter queue
-
-Configure the message broker (e.g., Azure Service Bus) with `MaxDeliveryCount = 5`. After 5 failed delivery attempts the message moves to the **dead-letter queue (DLQ)**:
-
-- Alert when DLQ depth > 0.
-- A DLQ message typically signals a poison payload (schema mismatch, corrupted data), not a transient error — inspect before replaying.
-- The corresponding row remains `Claimed` in `invint.InvoiceIntegration`. After investigation, either fix and re-enqueue or reset the row to `Pending`.
-
-The processor must only acknowledge a message **after** successfully writing `WaitingConfirmation`. A crash between submit and record triggers redelivery; idempotent state transitions prevent duplicate lifecycle progression.
-
----
-
-## EDICOM iPaaS API Reference
-
-Below are the endpoints used at each step of the pipeline. All endpoints require an OAuth 2.0 bearer token (acquired via the token endpoint). Reference: [EDICOM iPaaS Docs](https://ipaas-docs.edicomgroup.com/docs/openapi/eipaas-server-api/)
-
-### Step 1: Authenticate
-
-**Endpoint:** `POST https://accounts.edicomgroup.com/token`
-
-**Purpose:** Acquire an OAuth 2.0 access token for subsequent API calls.
-
-**Request:**
-
-```
-POST /token HTTP/1.1
-Host: accounts.edicomgroup.com
-Content-Type: application/x-www-form-urlencoded
-
-grant_type=password
-&username={username}
-&password={password}
-&scope=openid
-```
-
-**Response:**
-
-```json
-{
-  "access_token": "eyJ0eXAiOiJKV1QiLCJhbGc...",
-  "token_type": "Bearer",
-  "expires_in": 3600
-}
-```
-
-**Processor action:** Cache the token and refresh proactively ~30 seconds before expiry. Do not request a new token per invoice.
-
----
-
-### Step 2: Submit Invoice
-
-**Endpoint:** `POST /publish`
-
-**Purpose:** Submit a single invoice document to EDICOM for processing.
-
-**Request headers:**
-
-```
-Authorization: Bearer {access_token}
-Content-Type: application/json
-```
-
-**Request body** (inferred from integration pattern):
-
-```json
-{
-  "document": {
-    "invoiceNumber": "INV-12345",
-    "invoiceDate": "2026-07-22",
-    "amount": 1500.00,
-    "currency": "USD",
-    "... other invoice fields ..."
-  }
-}
-```
-
-**Response** (expected):
-
-```json
-{
-  "transactionId": "TXN-abc123def456",
-  "status": "submitted",
-  "timestamp": "2026-07-22T10:30:00Z"
-}
-```
-
-**Processor action:** Extract `transactionId`, update `invint.InvoiceIntegration` with `Status = WaitingConfirmation`.
-
-> **Note:** EDICOM does not expose a batch endpoint. Submit invoices individually or concurrently under a single token (see Options 3/4/5b for concurrent patterns).
-
----
-
-### Step 3: Receive Status — Webhook (Option 1)
-
-**Endpoint:** `POST {your-webhook-url}` (inbound from EDICOM)
-
-**Purpose:** EDICOM pushes the final status of an invoice when processing completes.
-
-**Inbound request body** (expected):
-
-```json
-{
-  "transactionId": "TXN-abc123def456",
-  "invoiceNumber": "INV-12345",
-  "status": "acknowledged|rejected|failed",
-  "edicomReference": "REF-xyz789",
-  "errorCode": "ERR_001",
-  "errorMessage": "Invalid amount"
-}
-```
-
-**Webhook handler action:**
-
-1. Validate the request is from EDICOM (HMAC signature, IP allowlist, or bearer token).
-2. Query `invint.InvoiceIntegration` for the `transactionId`.
-3. Update `Status = Acknowledged` or `Failed`, record `EdicomReference` if present.
-4. Return HTTP 200 to confirm delivery.
-
-> **Requirements:** Publicly reachable HTTPS endpoint. Idempotent — duplicate callbacks for the same transactionId must not create duplicate records.
-
----
-
-### Step 4: Poll Status — Reconciler (All Options)
-
-**Endpoint:** `GET /messages`
-
-**Purpose:** Query the status of submitted invoices. Acts as the primary mechanism for polling-only options (2, 4) or fallback safety net for webhook options (1, 3, 5).
-
-**Request:**
-
-```
-GET /messages?transactionId={transactionId}&status=*
-Authorization: Bearer {access_token}
-```
-
-**Response** (expected):
-
-```json
-{
-  "messages": [
-    {
-      "transactionId": "TXN-abc123def456",
-      "documentId": "DOC-12345",
-      "status": "acknowledged|pending|failed",
-      "edicomReference": "REF-xyz789",
-      "errorCode": "ERR_001",
-      "errorMessage": "Invalid amount",
-      "processedAt": "2026-07-22T10:35:00Z"
-    }
-  ]
-}
-```
-
-**Reconciler action:**
-
-1. Query `invint.InvoiceIntegration` for `Status = WaitingConfirmation AND SubmittedAt < NOW() - @GraceMinutes`.
-2. For each `transactionId`, call `GET /messages`.
-3. If status is `acknowledged` → update the row to `Acknowledged`.
-4. If status is `failed` → update the row to `Failed` with error code/message.
-5. If still `pending` → increment `ReconcileAttempts`; if >= max, write `Failed` + alert.
-
-**Polling interval:** 5–15 minutes (configurable per option).
-
----
 
 ### Step 5: Optional — Subscription / Webhook Registration
 
@@ -479,6 +370,101 @@ Authorization: Bearer {access_token}
 **Action:** Coordinate with EDICOM ops to register the webhook URL. May be a one-time setup or managed via their UI.
 
 > **Confirm with EDICOM:** Webhook retry policy, timeout, payload format, and authentication method.
+
+---
+
+## Invoice Status Definitions & Flows
+
+### Statuses
+
+| Status | Type | Meaning |
+|--------|------|---------|
+| `Pending` | In-flight | Upserted by cron; ready to be consumed from queue |
+| `Claimed` | In-flight | Processor owns the row; work in progress |
+| `WaitingConfirmation` | In-flight | Successfully submitted to EDICOM; awaiting terminal status |
+| `Acknowledged` | Terminal ✓ | EDICOM confirmed the invoice |
+| `Failed` | Terminal ✗ | Processing ended with an error; see `FailureReason` |
+
+### `FailureReason` values
+
+| Value | When |
+|-------|------|
+| `ValidationFailed` | Payload failed AE PINT validation before any EDICOM call |
+| `SubmitRejected` | EDICOM returned 400 / 422 — malformed payload, do not retry |
+| `MaxAttemptsExceeded` | Reconciler exhausted all polling attempts with no terminal status |
+
+> `CircuitOpen` is **not** a valid `FailureReason`. When the circuit breaker opens the row stays `Claimed` — it is a transient condition recovered by the next cron run, not a terminal failure.
+
+---
+
+### Flows
+
+**Happy path**
+```
+Cron discovers invoice
+  └─ UPSERT → Pending → published to queue
+
+Processor receives message
+  └─ Claimed → gather + validate + submit to EDICOM
+  └─ WaitingConfirmation (transactionId recorded)
+
+Completion
+  └─ Webhook arrives           → Acknowledged ✓
+     OR
+  └─ Reconciler polls EDICOM   → Acknowledged ✓
+```
+
+**Validation fails**
+```
+Processor receives message
+  └─ Claimed → payload validation fails
+  └─ Failed (ValidationFailed)
+  └─ Message acknowledged — no retry
+```
+
+**EDICOM rejects payload (400 / 422)**
+```
+Processor receives message
+  └─ Claimed → POST /publish → 400 / 422
+  └─ Failed (SubmitRejected)
+  └─ Message acknowledged — no retry
+```
+
+**Reconciler exhausted**
+```
+WaitingConfirmation past GraceMinutes
+  └─ Reconciler polls GET /messages each interval
+  └─ ReconcileAttempts >= max → Failed (MaxAttemptsExceeded) + alert
+```
+
+**EDICOM persistently down**
+```
+Processor receives message
+  └─ Claimed → POST /publish → Polly retries (1s, 2s, 4s) → all fail
+  └─ Circuit breaker opens → processor aborts
+  └─ Message NOT acknowledged → queue redelivers
+  └─ Row stays Claimed, queue empties, processor goes idle
+
+Next day cron fires
+  └─ Re-discovers same invoice from Source DB
+  └─ UPSERT resets → Pending, StaleResetCount++
+  └─ Re-published to queue → processor retries
+```
+
+**Processor crash / DLQ**
+```
+Processor receives message
+  └─ Claimed → crashes before acknowledging
+  └─ Queue redelivers (count 2, 3, 4, 5)
+  └─ Each redelivery: row is Claimed, not stale → processor cannot claim → abandons
+  └─ After 5 deliveries → message → DLQ, row stays Claimed
+  └─ Alert: DLQ depth > 0
+
+Next day cron fires
+  └─ Re-discovers invoice → UPSERT resets → Pending → re-published
+  └─ Only recovers if root cause (processor bug) is fixed first
+     otherwise → DLQ again
+```
 
 ---
 

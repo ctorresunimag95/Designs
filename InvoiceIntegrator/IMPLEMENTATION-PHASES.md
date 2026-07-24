@@ -28,6 +28,7 @@
 | `ProcessedAt`       | `DATETIME2`       | Yes      | `NULL`             | When the row reached a terminal state                                                     |
 | `ReconcileAttempts` | `INT`             | No       | `0`                | Incremented by reconciler on each poll with no terminal status                            |
 | `LastReconciledAt`  | `DATETIME2`       | Yes      | `NULL`             | Timestamp of last reconciler poll                                                         |
+| `StaleResetCount`   | `INT`             | No       | `0`                | Incremented each time stale claim recovery resets a stuck `Claimed` row; use to detect invoices that have been retried multiple times without reaching EDICOM |
 | `FailureReason`     | `NVARCHAR(50)`    | Yes      | `NULL`             | Internal code: `ValidationFailed`, `SubmitRejected`, `MaxAttemptsExceeded`, `CircuitOpen` |
 | `ErrorCode`         | `NVARCHAR(100)`   | Yes      | `NULL`             | EDICOM or AE PINT error code (e.g. `PEPPOL-EN16931-R001`)                                 |
 | `ErrorMessage`      | `NVARCHAR(2000)`  | Yes      | `NULL`             | Human-readable error detail from EDICOM or validator                                      |
