@@ -1,6 +1,6 @@
 ---
 status: proposed
-date: 2026-07-16
+date: 2026-07-28
 decision-makers: Camilo Torres
 consulted: EDICOM (pending API documentation and integration guidance)
 ---
@@ -13,27 +13,18 @@ The United Arab Emirates is introducing a mandatory e-invoicing regime built on 
 
 [EDICOM](https://edicomgroup.com/electronic-invoicing/united-arab-emirates) is an officially certified ASP for the UAE and exposes an enterprise REST API for invoice submission. We need an **internal system that extracts invoice datapoints from an existing line-of-business SQL database and publishes them to EDICOM**, so EDICOM can act as the middle-man to the UAE tax authority.
 
-Several hard constraints shape the design:
-
-- **The source SQL database is read-only to us.** We may query it to extract datapoints but must **not** add columns, flags, or tables to track what we have already sent. Duplicate-send prevention must therefore live in a store we own.
-- **The invoice number is unique** in the source system and is the natural business key for deduplication.
-- **The service is a scheduled, non-interactive worker.** It runs on a trigger at any given time (Azure Function timer trigger by default, or an App Service with a scheduler as an alternative) — it is not a request/response API.
-- **EDICOM's exact API contract and resilience guidance are not yet available.** The design must define sensible default resilience behaviour now and leave a clearly-marked seam to adopt EDICOM's official guidance once their API docs arrive.
-
-The core problems to solve are therefore: **(1) how to extract without a source-side marker, (2) how to guarantee an invoice is never sent to EDICOM twice, (3) how to audit every dispatch (success or failure) for a 7-year-retention regime, and (4) how to be resilient to transient EDICOM/network failures so a failed invoice is retried later rather than lost.**
-
 ---
 
 ## Decision Drivers
 
-- **No writes to the source database.** Deduplication and audit state must be owned by this system, never persisted back to the source.
-- **Exactly-once dispatch (effectively).** An invoice number that has already been accepted by EDICOM must never be sent again, even across overlapping or crashed runs.
-- **Auditability for compliance.** Every attempt — when we sent it, what EDICOM returned (success reference/UUID or error), how many attempts — must be durably recorded and retained for seven years.
-- **Resilience by default.** Transient failures (network, throttling, 5xx) must retry with backoff; exhausted records must be parked for later processing, not dropped.
-- **Provider-agnostic seam.** EDICOM's concrete API is behind an interface so its contract, authentication, and retry semantics can be implemented/tuned once documented — without touching extraction or tracking logic.
-- **Idempotent, restartable runs.** A run that crashes mid-batch must be safe to re-run; a claim mechanism prevents two concurrent runs sending the same invoice.
-- **Deployment flexibility.** The same core must run as an Azure Function (timer trigger) or under an App Service / container with a scheduler, without logic changes.
-- **Observability.** A single place for run metrics, per-invoice status, alerting on dead-lettered records, and reconciliation against the source.
+- **Exactly-once dispatch.** An invoice number that has already been accepted by EDICOM must never be sent again, even across overlapping or crashed runs.
+- **Auditability for compliance.** Every attempt — when we sent it, what EDICOM returned, how many reconcile attempts — must be durably recorded and retained for seven years.
+- **Decoupled intake and processing.** Both the cron and HTTP triggers share the same queue-backed processor; neither trigger contains processing logic.
+- **Asynchronous completion.** EDICOM does not return a terminal status synchronously on submit. Terminal status arrives via webhook or must be polled.
+- **Resilience by default.** Transient EDICOM failures retry with backoff; stuck invoices are recovered by the next cron run; the webhook has a polling fallback.
+- **Provider-agnostic seam.** EDICOM's concrete API is behind an interface so its contract, authentication, and retry semantics can be implemented and tuned once documented.
+- **Deployment flexibility.** Runs as an Azure Function (timer + HTTP triggers) or under an App Service with an in-process scheduler, without logic changes.
+- **Observability.** A single table provides per-invoice status, run metrics, alerting on DLQ depth, and reconciliation surfaces.
 
 ---
 
@@ -42,45 +33,46 @@ The core problems to solve are therefore: **(1) how to extract without a source-
 ### Architecture
 
 - Option A — Inline point-to-point: scheduled job reads source and pushes to EDICOM with no local state
-- Option B — Scheduled extractor + owned tracking store + EDICOM publisher (async, status-driven) ✅
-- Option C — Change-data-capture / event-driven off the source database
-
-### Deduplication & Tracking Store (sub-decision, applies once Option B is chosen)
-
-- Option 1 — Track state back in the source database
-- Option 2 — Dedicated SQL Server schema + table in a database we own ✅
-- Option 3 — Azure Table Storage / Cosmos DB tracking store
+- Option B — Scheduled extractor + owned tracking store, polling-only completion
+- **Option C — Per-invoice queue-based processing with webhook + polling fallback ✅**
+- Option D — Change-data-capture / event-driven off the source database
 
 ### Trigger / Hosting
 
-- Option T1 — Azure Function with timer trigger ✅ (default)
+- Option T1 — Azure Function with timer + HTTP triggers ✅ (default)
 - Option T2 — App Service / container host with an in-process scheduler (Quartz / Hangfire)
+
+### Completion mechanism
+
+- Option W1 — Polling-only reconciler (no webhook)
+- **Option W2 — Webhook callback (primary) + polling reconciler fallback ✅**
 
 ---
 
 ## Decision Outcome
 
-**Chosen architecture: Option B — Scheduled extractor + owned tracking store + EDICOM publisher.** On each run the service extracts candidate invoices from the source database, **left-anti-joins them against our own tracking store** to find invoices not yet successfully dispatched (plus retry-eligible ones), atomically **claims** each one, transforms and submits it to EDICOM through a provider-agnostic port, and records the outcome. This is the only option that satisfies the "no source writes" and "never send twice" constraints simultaneously while producing a complete audit trail.
+**Chosen architecture: per-invoice queue-based processing with webhook + polling fallback.**
 
-**Chosen tracking store: Option 2 — a dedicated SQL Server schema + table in a database we own.** A single table (`invint.InvoiceDispatch`) keyed by the unique invoice number, with a **UNIQUE constraint on `InvoiceNumber`** as the hard deduplication guarantee, holds per-invoice status, attempt count, EDICOM reference/UUID, last error, and audit timestamps. SQL Server is chosen over Table/Cosmos because the data is relational and low-volume, transactional claim semantics (`UPDATE … OUTPUT` / row locking) are first-class, the team already operates SQL Server, and reconciliation queries against the source are natural in the same engine.
+Each invoice — regardless of whether it was discovered by the cron batch or submitted via HTTP — flows through the same intake path: an upsert into `invint.InvoiceIntegration` followed by publishing the invoice number to `InvoiceProcessingQueue`. The processor consumer claims rows atomically from the queue, enriches and submits each invoice individually to EDICOM, then records the EDICOM `transactionId` and advances status to `WaitingConfirmation`. EDICOM pushes the terminal status via a webhook callback (primary, lowest latency); a polling reconciler cron provides a safety net for any missed callbacks.
 
-**Chosen trigger: Option T1 — Azure Function timer trigger by default**, with the hexagonal core deliberately host-agnostic so Option T2 (App Service + scheduler) is a drop-in alternative for environments where a long-running host or in-process scheduling is preferred.
+**Chosen tracking store: `invint.InvoiceIntegration` in a SQL Server database we own.** A `UNIQUE(InvoiceNumber)` constraint is the hard deduplication guarantee. SQL Server is chosen for first-class transactional claim semantics (`UPDATE … OUTPUT`), natural joins against the source database, and the team's existing operational familiarity.
 
-**Resilience:** Because EDICOM's official guidance is not yet available, the service ships with a **default resilience profile** (Polly-based retry with exponential backoff + jitter for transient faults; a status-driven "retry later" path for exhausted attempts; dead-lettering with alerting). This profile lives behind the EDICOM port and configuration, so it can be **replaced or tuned to match EDICOM's documented rate limits, idempotency keys, and error taxonomy** once received — see [Resilience Strategy](#resilience-strategy).
+**Chosen trigger: Azure Function (timer trigger + HTTP trigger) by default**, with the hexagonal core deliberately host-agnostic so an App Service + in-process scheduler is a drop-in alternative.
+
+**Chosen completion: webhook callback (primary) + polling reconciler (fallback).** The webhook delivers terminal status at lowest latency. The reconciler fires on a schedule, querying all rows in `WaitingConfirmation` past the grace period, and polls EDICOM's `GET /messages` endpoint until a terminal status is received or maximum attempts are exhausted.
 
 ### Consequences
 
-- Good, because the source database is never written to — all state lives in a store we own.
-- Good, because the `UNIQUE(InvoiceNumber)` constraint makes double-dispatch impossible at the database level, independent of application logic.
-- Good, because every dispatch attempt is durably audited (status, attempts, EDICOM reference/UUID, error, timestamps), satisfying the 7-year retention regime.
-- Good, because runs are idempotent and restartable: a crashed run leaves claimed rows that a later run reclaims after a visibility timeout.
-- Good, because transient EDICOM/network failures are retried automatically and exhausted records are parked for later processing rather than lost.
-- Good, because the EDICOM contract is isolated behind a port; adopting EDICOM's real API and resilience guidance changes one adapter, not the pipeline.
-- Good, because the same core runs unchanged as an Azure Function or under an App Service scheduler.
-- Bad, because the design depends on the invoice number genuinely being unique and stable in the source; a reused or mutated number would defeat deduplication (mitigated by a content hash — see design).
-- Bad, because it introduces and operates a new database/schema and a scheduled service that must be monitored.
-- Bad, because "extract every run and anti-join" costs a source query each run; a high-water-mark watermark is added to keep the candidate set bounded (see design). **The watermark field must be confirmed against the source schema** — it requires a monotonically increasing, stable field (e.g. an auto-increment `InvoiceId`, a `CreatedAtUtc` timestamp, or a sequential invoice number that is never recycled or backdated); if no suitable field exists, every run must perform a full scan until one is introduced.
-- Bad, because EDICOM specifics (auth, exact payload, error codes) are stubbed until their docs arrive — the first integration milestone is confirming the adapter against real EDICOM sandbox responses.
+- Good, because the source database is never written to — all state lives in `invint.InvoiceIntegration`.
+- Good, because `UNIQUE(InvoiceNumber)` makes double-dispatch impossible at the database level.
+- Good, because intake and processing are fully decoupled — both trigger types push to the same queue and share the same processor.
+- Good, because the webhook delivers terminal status with minimal latency; the reconciler ensures no invoice is silently stuck if the callback is missed.
+- Good, because every invoice lifecycle is durably tracked (status, transactionId, failure reason, timestamps), satisfying the 7-year retention regime.
+- Good, because the EDICOM contract is isolated behind a port; adopting the real API changes one adapter.
+- Good, because atomic claim prevents duplicate processing across concurrent processor instances.
+- Bad, because the design introduces a message broker (queue + DLQ) that must be provisioned and monitored.
+- Bad, because EDICOM specifics (auth, exact payload, error codes, webhook format) are stubbed until their docs arrive.
+- Bad, because the stale claim recovery path relies on the next cron run re-discovering the invoice from the source — invoices will remain stuck if no new invoices arrive to trigger the processor. See [Stale Claim Recovery](#stale-claim-recovery) for mitigations.
 
 ---
 
@@ -88,12 +80,506 @@ The core problems to solve are therefore: **(1) how to extract without a source-
 
 The decision is being followed if:
 
-- No code path issues an `INSERT`, `UPDATE`, `DELETE`, or DDL against the **source** database — the source connection is opened with a **read-only** login and architecture tests assert the source repository exposes only read methods.
-- `invint.InvoiceDispatch` has a `UNIQUE` constraint on `InvoiceNumber`; an integration test proves a second dispatch of the same invoice number is rejected/no-ops rather than producing a second EDICOM submission.
-- The EDICOM SDK/HTTP client is referenced **only** in the infrastructure adapter (`EdicomInvoicePublisher`) and nowhere else; `Application` has no dependency on any EDICOM or HTTP library (NetArchTest rule).
-- Every invoice that leaves `Sent` has a recorded terminal outcome (`Acknowledged`, `Failed`, or `DeadLettered`) with a timestamp and, on success, the EDICOM reference/UUID.
-- A crashed/duplicated run does not produce duplicate submissions (concurrency/claim integration test with two parallel runners over the same candidate set).
-- Records that exhaust their retry budget appear in `DeadLettered` and raise an alert — none are silently dropped.
+- No code path issues an `INSERT`, `UPDATE`, `DELETE`, or DDL against the **source** database — the source connection uses a read-only login and architecture tests assert the source repository exposes only read methods.
+- `invint.InvoiceIntegration` has a `UNIQUE` constraint on `InvoiceNumber`; an integration test proves a second intake of the same invoice number upserts (not duplicates) the row.
+- The EDICOM HTTP client is referenced **only** in the infrastructure adapter and nowhere in the Application layer (NetArchTest rule).
+- Every invoice that leaves `WaitingConfirmation` has a recorded terminal outcome (`Acknowledged` or `Failed`) with a timestamp and, on success, the EDICOM `transactionId`.
+- A crashed or duplicated run does not produce duplicate EDICOM submissions (concurrency/claim integration test with two parallel processor instances).
+- DLQ depth > 0 raises an alert; no messages are silently discarded.
+- The reconciler never marks `MaxAttemptsExceeded` without raising an alert.
+
+---
+
+## Trigger & Data Flow
+
+Intake and processing are decoupled. Intake always upserts the invoice row and publishes a message; the processor consumes messages, claims the row atomically, and runs the same EDICOM submission pipeline.
+
+```mermaid
+flowchart LR
+  subgraph triggers["Triggers"]
+    direction TB
+    cron([Timer Cron])
+    http([HTTP /trigger/invoice])
+  end
+
+  subgraph intake["Trigger Intake — executes on each trigger"]
+    direction TB
+    discover["Find candidate invoices\nfrom Source DB"]
+    upsert["Upsert invint.InvoiceIntegration\nStatus = Pending"]
+    publish[Publish invoiceNumber to queue]
+  end
+
+  subgraph broker["Message Broker"]
+    direction TB
+    q[(InvoiceProcessingQueue)]
+    dlq[(Dead-Letter Queue)]
+  end
+
+  subgraph proc["Processor Consumer — executes per message"]
+    direction TB
+    consume[Consume message]
+    claim["Atomic claim row\nStatus = Claimed"]
+    gather[Gather invoice data]
+    validate[Validate EDICOM payload]
+    token[Acquire / refresh OAuth token]
+    submit["POST /publish · per invoice"]
+    record["Record transactionId\nStatus = WaitingConfirmation"]
+  end
+
+  edicom{{EDICOM iPaaS}}
+
+  subgraph completion["Completion"]
+    direction TB
+    wh["Webhook handler\nVerify · write terminal status"]
+    rc([Reconciler Cron])
+    poll["Poll GET /messages\nby transactionId"]
+  end
+
+  sourcedb[(Source DB)]
+  extapi[(External APIs)]
+  otherdb[(Other DBs / Config)]
+  table[(invint.InvoiceIntegration)]
+
+  cron -->|fires| discover
+  sourcedb -->|"query candidates"| discover
+  http -->|"fires with invoiceNumber"| upsert
+  discover --> upsert
+  upsert -->|persist| table
+  upsert --> publish
+  publish --> q
+  q -. max retries .-> dlq
+
+  q -->|delivers message| consume
+  consume --> claim
+  claim -->|persist| table
+  claim --> gather
+  sourcedb -->|"core invoice fields"| gather
+  extapi -->|"enrichment data"| gather
+  otherdb -->|"config & supplemental"| gather
+  gather --> validate
+  validate --> token
+  token --> submit
+  submit -->|POST| edicom
+  submit --> record
+  record -->|persist| table
+
+  edicom -->|"POST callback — primary"| wh
+  wh -->|"write Acknowledged / Failed"| table
+
+  rc -->|"polls WaitingConfirmation past grace period"| poll
+  poll -->|GET /messages| edicom
+  poll -->|"write Acknowledged / Failed"| table
+```
+
+---
+
+## Sequence Diagrams
+
+### 1. Timer Cron — Trigger Intake
+
+Cron fires, discovers candidate invoices from Source DB, and publishes one message per invoice to the queue.
+
+```mermaid
+sequenceDiagram
+  participant Cron as Timer Cron
+  participant Intake as Trigger Intake
+  participant SrcDB as Source DB
+  participant IntDB as invint.InvoiceIntegration
+  participant Queue as InvoiceProcessingQueue
+
+  Cron->>Intake: fires (scheduled interval)
+  Intake->>SrcDB: query candidate invoices (last N hours)
+  SrcDB-->>Intake: invoice list
+
+  loop for each candidate invoice
+    Intake->>IntDB: UPSERT invoiceNumber (Status = Pending)
+    IntDB-->>Intake: row upserted / refreshed
+    Intake->>Queue: publish invoiceNumber
+    Queue-->>Intake: acknowledged
+  end
+```
+
+### 2. HTTP Manual Trigger — Intake
+
+An external caller submits a single invoice number. Intake upserts one row and publishes one message.
+
+```mermaid
+sequenceDiagram
+  participant Caller as External Caller
+  participant Handler as HTTP Trigger Handler
+  participant IntDB as invint.InvoiceIntegration
+  participant Queue as InvoiceProcessingQueue
+
+  Caller->>Handler: POST /trigger/invoice {invoiceNumber}
+  Handler->>IntDB: UPSERT invoiceNumber (Status = Pending)
+  IntDB-->>Handler: row upserted / refreshed
+  Handler->>Queue: publish invoiceNumber
+  Queue-->>Handler: acknowledged
+  Handler-->>Caller: 202 Accepted
+```
+
+### 3. Processor Consumer — Claim, Enrich, and Submit
+
+The processor consumes a queue message, claims the row, gathers all data from multiple sources, and submits to EDICOM.
+
+```mermaid
+sequenceDiagram
+  participant Queue as InvoiceProcessingQueue
+  participant Proc as Processor Consumer
+  participant IntDB as invint.InvoiceIntegration
+  participant SrcDB as Source DB
+  participant OtherDB as Other DBs / Config
+  participant ExtAPI as External APIs
+  participant Auth as Auth Server
+  participant Edicom as EDICOM iPaaS
+
+  Queue->>Proc: deliver message (invoiceNumber)
+  Proc->>IntDB: atomic claim row (Status = Claimed)
+  IntDB-->>Proc: row claimed
+
+  Proc->>SrcDB: fetch core invoice fields
+  SrcDB-->>Proc: invoice data
+  Proc->>OtherDB: fetch config & supplemental data
+  OtherDB-->>Proc: supplemental data
+  Proc->>ExtAPI: fetch enrichment data
+  ExtAPI-->>Proc: enrichment data
+
+  Proc->>Proc: validate full EDICOM payload
+
+  Proc->>Auth: POST /token (grant_type=password, scope=openid)
+  Auth-->>Proc: {access_token, expires_in: 3600}
+
+  Proc->>Edicom: POST /publish {invoice payload}
+  Edicom-->>Proc: {transactionId, status: submitted}
+
+  Proc->>IntDB: UPDATE transactionId + Status = WaitingConfirmation
+  IntDB-->>Proc: updated
+  Proc->>Queue: complete (acknowledge message)
+```
+
+### 4. Completion — Webhook Callback (primary) and Polling Reconciler (fallback)
+
+EDICOM pushes the terminal status via webhook. If the callback never arrives, the reconciler polls until a terminal status is received or maximum attempts are exhausted.
+
+#### 4a. Webhook callback
+
+```mermaid
+sequenceDiagram
+  participant Edicom as EDICOM iPaaS
+  participant WH as Webhook Handler
+  participant IntDB as invint.InvoiceIntegration
+  participant SrcDB as Source DB
+
+  Edicom->>WH: POST /webhook {transactionId, status, edicomReference, errorCode?}
+  WH->>WH: verify sender auth (HMAC / IP allowlist)
+  WH->>IntDB: query by transactionId
+  IntDB-->>WH: row found (WaitingConfirmation)
+  WH->>IntDB: UPDATE Status = Acknowledged / Failed
+  IntDB-->>WH: updated
+  WH->>SrcDB: Update Source DB with result status
+  SrcDB-->>WH: updated
+  WH-->>Edicom: 200 OK
+```
+
+#### 4b. Polling reconciler (fallback)
+
+```mermaid
+sequenceDiagram
+  participant RCron as Reconciler Cron
+  participant Rec as Reconciler Service
+  participant IntDB as invint.InvoiceIntegration
+  participant Edicom as EDICOM iPaaS
+
+  RCron->>Rec: fires (scheduled interval)
+  Rec->>IntDB: query Status = WaitingConfirmation AND SubmittedAt < NOW() - GraceMinutes
+  IntDB-->>Rec: stale rows
+
+  loop for each stale row
+    Rec->>Edicom: GET /messages?transactionId={id}
+    Edicom-->>Rec: status response
+
+    alt terminal status (acknowledged / failed)
+      Rec->>IntDB: UPDATE Status = Acknowledged / Failed
+    else still pending AND ReconcileAttempts < max
+      Rec->>IntDB: INCREMENT ReconcileAttempts
+    else ReconcileAttempts >= max
+      Rec->>IntDB: UPDATE Status = Failed (MaxAttemptsExceeded)
+      Rec->>Rec: trigger alert
+    end
+  end
+```
+
+---
+
+## Invoice Status Definitions & Flows
+
+### Statuses
+
+| Status                | Type       | Meaning                                                                           |
+| --------------------- | ---------- | --------------------------------------------------------------------------------- |
+| `Pending`             | In-flight  | Upserted by intake; ready to be consumed from queue                               |
+| `Claimed`             | In-flight  | Processor owns the row; work in progress                                          |
+| `WaitingConfirmation` | In-flight  | Successfully submitted to EDICOM; awaiting terminal status via webhook or polling |
+| `Acknowledged`        | Terminal ✓ | EDICOM confirmed the invoice                                                      |
+| `Failed`              | Terminal ✗ | Processing ended with an error; see `FailureReason`                               |
+
+### `FailureReason` values
+
+| Value                 | When                                                              |
+| --------------------- | ----------------------------------------------------------------- |
+| `ValidationFailed`    | Payload failed AE PINT validation before any EDICOM call          |
+| `SubmitRejected`      | EDICOM returned 400 / 422 — malformed payload, do not retry       |
+| `MaxAttemptsExceeded` | Reconciler exhausted all polling attempts with no terminal status |
+
+> `CircuitOpen` is **not** a valid `FailureReason`. When the circuit breaker opens the row stays `Claimed` — it is a transient condition recovered by the next cron run, not a terminal failure.
+
+### Status Lifecycle
+
+```
+Intake (cron or HTTP)
+  └─ UPSERT → Pending → published to queue
+
+Processor receives message
+  └─ Claimed → gather + validate + submit to EDICOM
+  └─ WaitingConfirmation (transactionId recorded)
+
+Completion
+  └─ Webhook arrives           → Acknowledged ✓ / Failed ✗
+     OR
+  └─ Reconciler polls EDICOM   → Acknowledged ✓ / Failed ✗
+```
+
+### Failure Flows
+
+**Validation fails**
+
+```
+Processor receives message
+  └─ Claimed → payload validation fails
+  └─ Failed (ValidationFailed)
+  └─ Message acknowledged — no retry
+```
+
+**EDICOM rejects payload (400 / 422)**
+
+```
+Processor receives message
+  └─ Claimed → POST /publish → 400 / 422
+  └─ Failed (SubmitRejected)
+  └─ Message acknowledged — no retry
+```
+
+**Reconciler exhausted**
+
+```
+WaitingConfirmation past GraceMinutes
+  └─ Reconciler polls GET /messages each interval
+  └─ ReconcileAttempts >= max → Failed (MaxAttemptsExceeded) + alert
+```
+
+**EDICOM persistently down**
+
+```
+Processor receives message
+  └─ Claimed → POST /publish → Polly retries (1s, 2s, 4s) → all fail
+  └─ Circuit breaker opens → processor aborts
+  └─ Message NOT acknowledged → queue redelivers
+  └─ Row stays Claimed, queue empties, processor goes idle
+
+Next day cron fires
+  └─ Re-discovers same invoice from Source DB
+  └─ UPSERT resets → Pending
+  └─ Re-published to queue → processor retries
+```
+
+**Processor crash / DLQ**
+
+```
+Processor receives message
+  └─ Claimed → crashes before acknowledging
+  └─ Queue redelivers (count 2, 3, 4, 5)
+  └─ Each redelivery: row is Claimed, not stale → processor cannot claim → abandons
+  └─ After 5 deliveries → message → DLQ, row stays Claimed
+  └─ Alert: DLQ depth > 0
+
+Next day cron fires
+  └─ Re-discovers invoice → UPSERT resets → Pending → re-published
+  └─ Only recovers if root cause (processor bug) is fixed first
+```
+
+---
+
+## Retry & Resiliency
+
+Each layer of the pipeline can fail independently. The table below maps failure modes to their recovery mechanism.
+
+| Failure                                       | Recovery mechanism                                                  |
+| --------------------------------------------- | ------------------------------------------------------------------- |
+| Transient EDICOM submit error (5xx / timeout) | Polly retry with exponential backoff                                |
+| EDICOM persistently unavailable               | Circuit breaker → abort run → stale claim recovery                  |
+| Processor crash after claim, before submit    | Stale claim reset in next processor run                             |
+| Processor crash after submit, before record   | Message redelivered; idempotent state transition prevents duplicate |
+| Webhook callback never arrives                | Polling reconciler fires after `GraceMinutes`                       |
+| WaitingConfirmation never resolves            | Reconciler max-attempts → mark `Failed` + alert                     |
+| Token endpoint unavailable                    | Retry token fetch → abort run → stale claim recovery                |
+| Partial batch failure                         | Per-invoice tracking; failed invoices recover via stale claim reset |
+| Queue message fails repeatedly                | Dead-letter queue (DLQ) → alert on DLQ depth                        |
+
+### Submit retry — Polly
+
+Every `POST /publish` call goes through a **retry + circuit-breaker** policy:
+
+```
+Retry:           3 attempts, exponential backoff — 1 s → 2 s → 4 s
+Retry triggers:  HTTP 429, 5xx, network timeout
+Circuit breaker: open after 5 consecutive failures; half-open probe after 30 s
+```
+
+When the circuit breaker opens, the processor aborts the current run; already-claimed invoices are recovered by stale claim reset on the next cron run.
+
+Do **not** retry HTTP 400 / 422 — these indicate a malformed payload. Log the error, write `Failed` to `invint.InvoiceIntegration`, and move on.
+
+### Stale claim recovery
+
+> **Important:** The stale claim reset is embedded in the processor's claim query — it only runs when the processor consumes a message from the queue. With a once-a-day cron trigger, the processor goes idle once the queue is empty. There is no background process waking the processor up every 30 minutes.
+
+**What actually happens when EDICOM is down:**
+
+```
+DAY 1 — Cron fires (08:00, once)
+─────────────────────────────────────────────────────────
+  08:00  Cron fires → discovers INV-001 → UPSERT Status = Pending
+         └─ Publishes INV-001 to queue
+
+  08:02  Processor wakes up (queue message received)
+         └─ Claim query runs → Status = Claimed, ClaimedAt = 08:02
+         └─ Gathers data, builds payload
+         └─ POST /publish → EDICOM DOWN
+            ├─ Retry 1 (1s)  → fails
+            ├─ Retry 2 (2s)  → fails
+            ├─ Retry 3 (4s)  → fails
+            └─ Circuit breaker opens → processor aborts
+               Queue empty → processor goes idle
+
+  INV-001 stays: Status = Claimed, ClaimedAt = 08:02
+  Queue empty → processor idle for the rest of the day
+
+─────────────────────────────────────────────────────────
+DAY 2 — Cron fires (08:00, once)
+─────────────────────────────────────────────────────────
+  08:00  Cron fires → queries Source DB
+         └─ Finds INV-001 (still unprocessed) + INV-002 (new)
+         └─ UPSERT INV-001 → resets Status = Pending  ← cron drives the retry
+         └─ UPSERT INV-002 → Status = Pending
+         └─ Publishes both to queue
+```
+
+> **Result:** Stuck invoices are retried the next day when new invoices arrive and wake the processor. If no new invoices come in, the stuck invoice waits until the next cron run that finds any pending work.
+
+### Options to improve stale claim recovery
+
+**Option A — Housekeeping cron (operational)**
+
+Add a lightweight scheduled job (every 30 min) that re-publishes stale `Claimed` rows back to the queue independently of the daily trigger. Keeps retry cadence at 30 min regardless of whether new invoices arrive.
+
+```
+Every 30 min:
+  Query: Status = Claimed AND ClaimedAt < NOW() - ClaimTimeoutMinutes
+         AND StaleResetCount < MaxStaleResets
+  For each stale row:
+    └─ Increment StaleResetCount
+    └─ Reset Status = Pending
+    └─ Re-publish invoiceNumber to queue
+  If StaleResetCount >= MaxStaleResets:
+    └─ Status = Failed (MaxAttemptsExceeded)
+    └─ Trigger alert
+```
+
+**Option B — Dashboard / monitoring (observability)**
+
+Without adding a new cron, expose stuck invoices via a monitoring alert:
+
+```sql
+SELECT InvoiceNumber, ClaimedAt, StaleResetCount, FailureReason
+FROM   invint.InvoiceIntegration
+WHERE  Status = 'Claimed'
+  AND  StaleResetCount >= 2
+ORDER  BY ClaimedAt ASC
+```
+
+Alert when any row has `StaleResetCount >= 2`. Ops can reset rows to `Pending` manually when EDICOM recovers.
+
+> **Recommendation:** Option B has zero infrastructure cost. Add Option A only if next-day retry violates your SLA.
+
+---
+
+## Design Notes
+
+### Token handling
+
+Acquire a token once per processor run (`POST https://accounts.edicomgroup.com/token`, scope `openid`). Cache it with its `expires_in` value and refresh proactively before expiry. Never request a new token per invoice.
+
+### Idempotency
+
+Use `UNIQUE(InvoiceNumber)` on `invint.InvoiceIntegration` to collapse duplicate trigger events and keep one lifecycle row per invoice.
+
+If the processor crashes after submit but before writing `WaitingConfirmation`, the same invoice may be retried; atomic state transitions and the uniqueness constraint keep persistence idempotent.
+
+### Claim pattern
+
+Use a single `UPDATE … SET Status = 'Claimed', ClaimedAt = NOW() WHERE Status = 'Pending' [OR stale claimed]` with `OUTPUT` / `RETURNING` to atomically claim a row and prevent double-processing across concurrent instances.
+
+### EDICOM status endpoint
+
+Until the webhook integration is confirmed, treat the `GET /messages` response as the authoritative status source. The reconciler polls this for all `WaitingConfirmation` rows.
+
+### Webhook registration
+
+**Endpoint:** `POST /subscription` or similar (details TBD with EDICOM team)
+
+Register or update the webhook callback URL so EDICOM knows where to push terminal status. May be a one-time setup or managed via the EDICOM portal.
+
+> **Confirm with EDICOM:** Webhook retry policy, timeout, payload format, and authentication method (HMAC / IP allowlist).
+
+---
+
+## Tracking Table Schema
+
+```sql
+CREATE SCHEMA invint;
+GO
+
+CREATE TABLE invint.InvoiceIntegration (
+    InvoiceNumber        VARCHAR(64)     NOT NULL,
+    Status               VARCHAR(24)     NOT NULL,             -- Pending|Claimed|WaitingConfirmation|Acknowledged|Failed
+    FailureReason        VARCHAR(32)     NULL,                 -- ValidationFailed|SubmitRejected|MaxAttemptsExceeded
+    TransactionId        VARCHAR(128)    NULL,                 -- EDICOM transaction id (set after submit)
+    EdicomReference      VARCHAR(128)    NULL,                 -- EDICOM document reference (set on Acknowledged)
+    ClaimedAt            DATETIME2       NULL,
+    SubmittedAt          DATETIME2       NULL,
+    AcknowledgedAt       DATETIME2       NULL,
+    ReconcileAttempts    INT             NOT NULL DEFAULT 0,
+    StaleResetCount      INT             NOT NULL DEFAULT 0,
+    LastErrorCode        VARCHAR(64)     NULL,
+    LastErrorMessage     NVARCHAR(2000)  NULL,
+    CreatedAt            DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    UpdatedAt            DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_InvoiceIntegration PRIMARY KEY (InvoiceNumber),
+    CONSTRAINT UQ_InvoiceIntegration_InvoiceNumber UNIQUE (InvoiceNumber)
+);
+GO
+
+-- Fast status scans (processor claim, reconciler, monitoring)
+CREATE INDEX IX_InvoiceIntegration_Status_ClaimedAt
+    ON invint.InvoiceIntegration (Status, ClaimedAt)
+    INCLUDE (StaleResetCount, TransactionId);
+
+CREATE INDEX IX_InvoiceIntegration_Status_SubmittedAt
+    ON invint.InvoiceIntegration (Status, SubmittedAt)
+    INCLUDE (TransactionId, ReconcileAttempts);
+```
+
+> The primary key already enforces uniqueness; the explicit `UQ_` constraint makes the dedup guarantee unmistakable and satisfies the Confirmation check. `StaleResetCount` tracks how many times a stale `Claimed` row was reset to `Pending`; `ReconcileAttempts` tracks polling rounds in the fallback reconciler.
 
 ---
 
@@ -101,318 +587,72 @@ The decision is being followed if:
 
 ### Option A — Inline point-to-point (no local state)
 
-`Scheduled job queries the source and POSTs each invoice to EDICOM in the same loop, with no persisted tracking.`
-
 - Good, because it is the least code and has no extra store to operate.
-- Bad, because there is **no way to know what was already sent** without writing to the source — which is forbidden — so re-runs re-send everything.
+- Bad, because there is **no way to know what was already sent** without writing to the source — which is forbidden.
 - Bad, because a crash mid-run leaves an unknown partial state; recovery is guesswork.
 - Bad, because there is no audit trail for a 7-year-retention regime.
-- Bad, because a transient EDICOM failure loses the invoice for that run with no structured retry.
+- Bad, because there is no mechanism to receive EDICOM's asynchronous terminal status.
 
-### Option B — Scheduled extractor + owned tracking store + EDICOM publisher (chosen)
+### Option B — Scheduled extractor + owned tracking store, polling-only completion
 
 - Good, because deduplication and audit live in a store we own without touching the source.
-- Good, because status-driven processing gives idempotent, restartable runs and a natural retry-later path.
-- Good, because it produces a complete, queryable audit trail and reconciliation surface.
-- Good, because the EDICOM contract and resilience policy are isolated and swappable.
-- Neutral, because it requires one extra source query per run (bounded by a watermark) and a claim step.
-- Bad, because it introduces a new store and service to operate and monitor.
+- Bad, because polling-only completion requires the reconciler to fire repeatedly until EDICOM responds; there is no low-latency path for the happy case.
+- Neutral, because webhook support can be added later without architecture changes.
 
-### Option C — Change-data-capture / event-driven off the source
+### Option C — Per-invoice queue-based processing with webhook + polling fallback (chosen)
 
-`Use SQL CDC / change tracking / triggers on the source to emit invoice events to a queue that the publisher consumes.`
+- Good, because intake and processing are fully decoupled — both trigger types share the same pipeline.
+- Good, because the webhook delivers terminal status at lowest latency; the reconciler covers the failure case.
+- Good, because per-invoice queue messages give natural retry and DLQ semantics.
+- Good, because the processor is stateless and horizontally scalable.
+- Bad, because it introduces a message broker (queue + DLQ) to provision and operate.
+- Neutral, because it requires confirming the webhook contract with EDICOM before the completion path is fully exercised.
 
-- Good, because it reacts in near-real-time instead of on a schedule.
-- Good, because the candidate set is naturally incremental (only changed rows).
-- Bad, because enabling CDC/change-tracking or triggers is a **modification of the source database**, which is out of bounds for us.
-- Bad, because it adds queue infrastructure and a more complex operational model than the phased, scheduled mandate requires.
-- Bad, because ordering/replay and duplicate events still need an owned dedup store — so it does not remove Option B's store, it adds to it. Reconsider only if near-real-time submission becomes a requirement and source-side CDC becomes permissible.
+### Option D — Change-data-capture / event-driven off the source
 
----
-
-### Option 1 — Track state in the source database
-
-- Good, because a single database holds both invoices and their dispatch state, simplifying joins.
-- Bad, because it **requires writing to the source** (a new column/table/flag) — explicitly forbidden.
-- Bad, because it couples our processing lifecycle to a database we do not own or control the schema of.
-
-### Option 2 — Dedicated SQL Server schema + table (chosen)
-
-`Own database, schema invint, table InvoiceDispatch keyed by InvoiceNumber with UNIQUE constraint.`
-
-- Good, because it never touches the source — state is fully ours.
-- Good, because a `UNIQUE(InvoiceNumber)` constraint is a hard, engine-enforced dedup guarantee.
-- Good, because transactional claim (`UPDATE … OUTPUT`, row locks) and retry-window queries are first-class in SQL.
-- Good, because reconciliation against the source (same engine/toolchain) and 7-year auditing are straightforward.
-- Neutral, because it is one more database object to provision, back up, and retain.
-- Bad, because at very high volume a single hot table needs index care (mitigated: low invoice volume, indexed status/next-attempt columns).
-
-### Option 3 — Azure Table Storage / Cosmos DB tracking store
-
-- Good, because it is serverless, cheap at scale, and needs no schema migrations.
-- Good, because a point lookup by `InvoiceNumber` (partition/row key) is fast for the dedup check.
-- Bad, because atomic multi-row claim and "due for retry" range queries are clumsier than a SQL `UPDATE … WHERE status = … AND nextAttempt <= now`.
-- Bad, because reconciliation joins against the SQL source now cross two stores/engines.
-- Neutral, because it remains a valid swap: `IDispatchStore` is an interface, so a `TableDispatchStore` can replace the SQL adapter if operational preference changes.
+- Good, because it reacts in near-real-time.
+- Bad, because enabling CDC/change-tracking is a **modification of the source database**, which is out of bounds.
+- Bad, because it adds queue infrastructure without removing Option C's tracking store.
 
 ---
 
-### Option T1 — Azure Function timer trigger (chosen default)
+### Option T1 — Azure Function timer + HTTP triggers (chosen default)
 
-- Good, because it is fully managed, scales to zero, and the timer schedule is declarative (CRON).
-- Good, because it matches a "runs at any given time" batch model with no host to keep alive.
-- Neutral, because execution time limits (Consumption plan) require the run to be batch-bounded and resumable — which the claim/status model already provides.
-- Bad, because very large catch-up batches may need the Premium/Dedicated plan to avoid timeouts.
+- Good, because it is fully managed, scales to zero, and the trigger schedule is declarative.
+- Good, because the HTTP trigger gives a built-in single-invoice submission endpoint.
+- Neutral, because execution time limits (Consumption plan) require bounded batches — which the per-invoice queue model already provides.
 
 ### Option T2 — App Service / container + in-process scheduler (Quartz / Hangfire)
 
-- Good, because it suits long-running or high-frequency schedules and gives full control over execution windows.
-- Good, because Hangfire adds a built-in dashboard, retries, and job persistence.
-- Bad, because it runs an always-on host (cost) and adds a scheduler dependency.
-- Neutral, because the hexagonal core is identical — only the driving adapter/composition root differs, so this is a deployment choice, not an architecture change.
+- Good, because it suits long-running or high-frequency schedules.
+- Good, because Hangfire adds a built-in dashboard and job persistence.
+- Bad, because it runs an always-on host (cost).
+- Neutral, because the hexagonal core is identical — only the driving adapter differs.
 
 ---
 
-## Resilience Strategy
+### Option W1 — Polling-only reconciler (no webhook)
 
-> **This section defines the _default_ profile. It is explicitly provisional and must be reconciled with EDICOM's official API documentation and integration guidance once available** — in particular their authentication model, idempotency-key mechanism, rate limits, retry-after semantics, and error taxonomy. Everything here lives behind the `IInvoicePublisher` port and configuration so it can be tuned without touching the extraction/tracking pipeline.
+- Good, because it removes the need to register and verify a webhook endpoint with EDICOM.
+- Bad, because every invoice must wait for the next reconciler interval to learn its terminal status — no low-latency happy path.
+- Neutral, because this remains a valid fallback if EDICOM does not support webhooks.
 
-**Fault classification.** Responses from EDICOM are classified into three buckets by the adapter:
+### Option W2 — Webhook callback (primary) + polling reconciler fallback (chosen)
 
-| Class         | Examples (assumed until EDICOM confirms)                                     | Action                                                 |
-| ------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------ |
-| **Transient** | Network timeout, connection reset, HTTP 429, 502/503/504                     | Retry with backoff (in-run, bounded)                   |
-| **Permanent** | HTTP 400/422 validation errors, 401/403 auth/permission, business rejections | No in-run retry → mark `Failed`; needs data/config fix |
-| **Unknown**   | Anything unmapped                                                            | Treat as transient once, then escalate to `Failed`     |
-
-**In-run retry (Polly).** Transient faults are retried inside the run using **exponential backoff with jitter** (e.g. base 2s, factor 2, ±20% jitter, max ~5 attempts) plus a **circuit breaker** so a sustained EDICOM outage short-circuits the rest of the batch quickly rather than hammering it. Defaults are configuration values.
-
-**Cross-run "retry later".** If in-run retries are exhausted (or the circuit is open), the invoice is **not** dropped: it is written back as `Retryable` with an incremented `AttemptCount` and a computed `NextAttemptAtUtc` (backoff schedule). The **next scheduled run** picks up all rows where `Status = Retryable AND NextAttemptAtUtc <= now`, so recovery is automatic across runs without any queue.
-
-**Dead-lettering.** When `AttemptCount` exceeds the configured maximum (e.g. 8), the row transitions to `DeadLettered`, which raises an alert and is excluded from automatic pick-up. It requires manual inspection/replay (a supported operation resets it to `Retryable`).
-
-**Idempotency toward EDICOM.** The invoice number (and/or the per-invoice UUID) is sent as EDICOM's idempotency/reference key **if EDICOM supports one** (to be confirmed). Combined with our own claim + `UNIQUE(InvoiceNumber)` guard, this makes a retry after an ambiguous timeout safe: we reconcile by querying EDICOM's status for that reference before re-submitting, rather than blindly re-sending.
-
-**Crash safety / claim visibility timeout.** A row is `Claimed` (with a `ClaimedAtUtc`/owner) before submission. If a run crashes after claiming but before recording an outcome, a later run reclaims rows whose claim is older than a visibility timeout — preventing both permanent stranding and concurrent double-send.
-
-**Poison-message protection.** A permanent validation failure never re-enters the transient retry loop; it goes straight to `Failed` with the structured EDICOM error stored for triage.
+- Good, because the webhook delivers terminal status immediately on the happy path.
+- Good, because the reconciler covers missed or delayed callbacks without requiring any change to the processor.
+- Bad, because it requires confirming the webhook contract, payload format, and authentication method with EDICOM.
 
 ---
 
-## More Information
+## Open Questions
 
-### High-Level Flow
+### To close with EDICOM
 
-```
-Scheduler (timer / cron)
-  │  trigger run
-  ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Invoice Integrator (worker)                                  │
-│  1. Read candidate invoices from SOURCE DB (read-only)        │
-│     — bounded by high-water-mark watermark                    │
-│  2. Anti-join against invint.InvoiceDispatch                  │
-│     — new invoices + rows Retryable & due                     │
-│  3. For each candidate:                                       │
-│     a. Claim row (Pending/Retryable → Claimed) [atomic]       │
-│     b. Map source datapoints → EDICOM payload (AE PINT/UBL)   │
-│     c. Submit to EDICOM via IInvoicePublisher                 │
-│        · transient error → Polly retry (backoff+jitter)       │
-│     d. On accept  → Sent → Acknowledged (+ EDICOM ref/UUID)   │
-│        On reject  → Failed (store EDICOM error)               │
-│        On exhaust → Retryable (+ NextAttemptAtUtc)            │
-│                     or DeadLettered (attempts > max)          │
-│  4. Record audit + update watermark                           │
-└───────────────────────────────┬──────────────────────────────┘
-                                │  REST (structured invoice)
-                                ▼
-                     ┌────────────────────────┐
-                     │  EDICOM (ASP / Peppol   │
-                     │  Access Point)          │
-                     │  · convert to AE PINT   │
-                     │  · route to buyer AP    │
-                     │  · report to FTA        │
-                     └────────────────────────┘
-```
-
-```mermaid
-flowchart LR
-    Sched([Scheduler<br/>timer / cron])
-    subgraph Worker[Invoice Integrator host]
-        Run[RunDispatchBatch]
-        Pub[IInvoicePublisher<br/>EdicomInvoicePublisher]
-    end
-    Source[(Source SQL DB<br/>READ-ONLY)]
-    Track[(invint.InvoiceDispatch<br/>owned SQL Server<br/>UNIQUE InvoiceNumber)]
-    Edicom{{EDICOM ASP<br/>Peppol Access Point}}
-    FTA[UAE FTA<br/>tax platform]
-
-    Sched -- "trigger" --> Run
-    Run -- "read candidates (watermark)" --> Source
-    Run -- "anti-join / find due" --> Track
-    Run -- "claim + status writes" --> Track
-    Run --> Pub
-    Pub -- "POST structured invoice" --> Edicom
-    Edicom -- "accept + reference/UUID" --> Pub
-    Edicom -- "convert · route · report" --> FTA
-```
-
-### Invoice Dispatch Status Lifecycle
-
-| Status         | Meaning                                                                                | Terminal?                |
-| -------------- | -------------------------------------------------------------------------------------- | ------------------------ |
-| `Pending`      | Discovered from source; not yet attempted                                              | no                       |
-| `Claimed`      | Reserved by a run for submission (has owner + `ClaimedAtUtc`)                          | no                       |
-| `Sent`         | Submitted to EDICOM; awaiting/holding accept confirmation                              | no                       |
-| `Acknowledged` | EDICOM accepted; reference/UUID recorded                                               | ✅                       |
-| `Failed`       | Permanent rejection (validation/business); needs a fix                                 | ✅ (until manual replay) |
-| `Retryable`    | Transient failure or exhausted in-run retries; eligible next run at `NextAttemptAtUtc` | no                       |
-| `DeadLettered` | Retry budget exhausted; alert raised; manual intervention                              | ✅ (until manual replay) |
-
-```
-Pending ──► Claimed ──► Sent ──► Acknowledged
-              │           └──► Retryable ──► (next run) ──► Claimed
-              │           └──► Failed
-              └──► Retryable ──► DeadLettered (attempts > max)
-```
-
-### Deduplication Rules
-
-| Scenario                                                                      | Behaviour                                                                               |
-| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Invoice number not in tracking store                                          | Insert `Pending`, claim, submit                                                         |
-| Invoice number present, status `Acknowledged`                                 | Skip — already sent (never re-submit)                                                   |
-| Invoice number present, status `Failed`                                       | Skip automatic pick-up — awaits data fix / manual replay                                |
-| Invoice number present, status `Retryable` and `NextAttemptAtUtc <= now`      | Claim and re-submit                                                                     |
-| Invoice number present, status `Claimed`/`Sent` within visibility timeout     | Skip — in flight in another run                                                         |
-| Invoice number present, status `Claimed`/`Sent` older than visibility timeout | Reclaim (previous run assumed crashed)                                                  |
-| Concurrent insert race on same invoice number                                 | `UNIQUE(InvoiceNumber)` rejects the second insert — no duplicate row, no duplicate send |
-
-### Tracking Table (owned SQL Server)
-
-```sql
-CREATE SCHEMA invint;
-GO
-
-CREATE TABLE invint.InvoiceDispatch (
-    InvoiceNumber      VARCHAR(64)   NOT NULL,             -- business key from source (unique)
-    SourceSystem       VARCHAR(32)   NOT NULL,             -- provenance, for multi-source future
-    Status             VARCHAR(20)   NOT NULL,             -- Pending|Claimed|Sent|Acknowledged|Failed|Retryable|DeadLettered
-    AttemptCount       INT           NOT NULL DEFAULT 0,
-    PayloadHash        CHAR(64)      NULL,                 -- SHA-256 of mapped payload; detects source mutation
-    EdicomReference    VARCHAR(128)  NULL,                 -- EDICOM transaction id
-    InvoiceUuid        UNIQUEIDENTIFIER NULL,              -- per-invoice UUID (traceability)
-    LastErrorCode      VARCHAR(64)   NULL,
-    LastErrorMessage   NVARCHAR(2000) NULL,
-    ClaimedBy          VARCHAR(64)   NULL,                 -- run/instance id owning the claim
-    ClaimedAtUtc       DATETIME2     NULL,
-    NextAttemptAtUtc   DATETIME2     NULL,                 -- backoff schedule for Retryable
-    CreatedAtUtc       DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-    UpdatedAtUtc       DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-    SentAtUtc          DATETIME2     NULL,
-    AcknowledgedAtUtc  DATETIME2     NULL,
-    CONSTRAINT PK_InvoiceDispatch PRIMARY KEY (InvoiceNumber),
-    CONSTRAINT UQ_InvoiceDispatch_InvoiceNumber UNIQUE (InvoiceNumber)  -- hard dedup guarantee
-);
-GO
-
--- Fast "due for processing" scan
-CREATE INDEX IX_InvoiceDispatch_Status_NextAttempt
-    ON invint.InvoiceDispatch (Status, NextAttemptAtUtc)
-    INCLUDE (AttemptCount, ClaimedAtUtc);
-```
-
-> The primary key already enforces uniqueness; the explicit `UQ_` constraint is stated to make the dedup guarantee unmistakable in the schema and satisfy the Confirmation check. `PayloadHash` lets a future enhancement detect that a source row changed after acknowledgement (out of scope for v1 — acknowledged invoices are immutable).
-
-> **`SourceSystem` note.** In v1 there is a single source database, so `SourceSystem` will hold one hardcoded value (e.g. `"UAE-ERP"`). The column is reserved for a potential future where multiple source systems feed the same tracking store. If that happens, the current `UNIQUE(InvoiceNumber)` constraint would need to be replaced with `UNIQUE(InvoiceNumber, SourceSystem)` — because two different source systems could independently issue an invoice with the same number. This constraint change is a **breaking schema migration** and must be planned at that point. For v1, the value to use should be agreed with the team and set in configuration, not hardcoded in source.
-
-### Run State Table — High-Water Mark (owned SQL Server)
-
-A second table in the `invint` schema holds the watermark and any other per-run state. It is read at the **start** of every run and updated at the **end** of a successful run.
-
-```sql
-CREATE TABLE invint.RunState (
-    Key          VARCHAR(64)   NOT NULL,
-    Value        VARCHAR(128)  NOT NULL,
-    UpdatedAtUtc DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT PK_RunState PRIMARY KEY (Key)
-);
-GO
-
--- Seed on first deploy. '0' means "fetch everything from the beginning".
-INSERT INTO invint.RunState (Key, Value) VALUES ('HighWaterMark', '0');
-```
-
-**How the watermark is used per run:**
-
-| Step | Action |
-|---|---|
-| Start of run | Read `Value` WHERE `Key = 'HighWaterMark'` → use as `@LastHighWaterMark` in the source query |
-| Query source | `WHERE <watermark field> > @LastHighWaterMark` |
-| End of successful run | `UPDATE invint.RunState SET Value = <max watermark seen>, UpdatedAtUtc = SYSUTCDATETIME() WHERE Key = 'HighWaterMark'` |
-| Crashed run | Watermark is **not** updated — next run re-fetches the same window (safe due to anti-join + `UNIQUE` constraint) |
-
-**Watermark field candidates (to confirm against source schema):**
-
-| Candidate | Type | Use if... |
-|---|---|---|
-| Auto-increment `InvoiceId` | `BIGINT` / `INT` | IDs are never recycled or backfilled — **preferred** |
-| `CreatedAtUtc` / `CreatedDate` | `DATETIME2` | Timestamps are DB-set and never backdated; store as ISO-8601 string |
-| Sequential invoice number | `VARCHAR` / `INT` | Guaranteed numeric, ordered, and never reused |
-| None available | — | Full scan every run until a suitable field is introduced; flag as performance risk |
-
-> The watermark field must be confirmed with the source DB owner before implementation — see [Open Questions (to close with source DB owner)](#open-questions-to-close-with-source-db-owner).
-
-**Candidate extraction query (illustrative — field names to be confirmed against source schema):**
-
-```sql
--- @LastHighWaterMark  : value from invint.RunState WHERE Key = 'HighWaterMark'
--- @VisibilityTimeout  : DATEADD(MINUTE, -@VisibilityTimeoutMinutes, SYSUTCDATETIME())
---                       computed in application from config (default 10 min)
-
-SELECT
-    s.InvoiceNumber,
-    s.InvoiceDate,
-    s.CustomerName
-    -- ... other source fields required for the EDICOM payload
-FROM source.Invoices s
-LEFT JOIN invint.InvoiceDispatch d ON d.InvoiceNumber = s.InvoiceNumber
-WHERE
-    -- watermark: only rows newer than last successful run
-    s.InvoiceId > @LastHighWaterMark
-    AND (
-        d.InvoiceNumber IS NULL                                                          -- never seen → insert Pending + claim
-        OR (d.Status = 'Retryable'  AND d.NextAttemptAtUtc <= SYSUTCDATETIME())          -- due for retry
-        OR (d.Status IN ('Claimed', 'Sent') AND d.ClaimedAtUtc < @VisibilityTimeout)     -- stale claim → previous run crashed, reclaim
-    );
--- Rows with Status IN ('Acknowledged','Failed','DeadLettered') are excluded by the above conditions.
-```
-
-> `s.InvoiceId` is used as the watermark field in this example — replace with the confirmed monotonically increasing field from the source schema (`CreatedAtUtc`, sequential invoice number, etc.). `@VisibilityTimeoutMinutes` is a configuration value (default `10`); the cutoff is computed in application code as `DateTime.UtcNow.AddMinutes(-visibilityTimeoutMinutes)` and passed as `@VisibilityTimeout`.
-
-### Open Questions (to close with EDICOM)
-
-1. Exact REST endpoint(s), payload schema, and whether EDICOM accepts source-native data and does the AE PINT/UBL conversion, or expects pre-built UBL.
+1. Exact REST endpoint(s), payload schema, and whether EDICOM accepts source-native data or expects pre-built AE PINT/UBL.
 2. Authentication model (API key, OAuth2 client credentials, mTLS certificate).
-3. Idempotency-key support and the reconciliation/status-query endpoint for ambiguous timeouts.
-4. Rate limits, throttling headers (`Retry-After`), and recommended batch size.
-5. Error taxonomy — which codes are permanent vs. transient — to finalise fault classification.
-6. Who assigns the invoice **UUID** (us or EDICOM) and how acknowledgements/UUIDs are returned.
-
-### Open Questions (to close with source DB owner)
-
-1. **Watermark field** — Does the source table expose a reliable, monotonically increasing field suitable for use as a high-water-mark? Candidates to confirm:
-   - Auto-increment integer primary key (e.g. `InvoiceId`) — preferred if IDs are never recycled or backfilled.
-   - `CreatedAtUtc` / `CreatedDate` timestamp — viable if timestamps are set by the database (not the application) and are never backdated.
-   - Sequential business invoice number — only if it is guaranteed to be numeric, ordered, and never reused.
-   - If none of these exist, the extraction query must perform a full scan every run until a suitable field is available; this should be flagged as a performance risk for large datasets.
-
-### Notes
-
-**UAE e-invoicing mandate — background (per EDICOM; pending confirmation against official FTA guidance).** The following context informed the design but does not drive any architectural decision above. Dates and thresholds are summarised from EDICOM's UAE page and should be confirmed against the primary UAE Ministry of Finance / Federal Tax Authority sources before the ADR is finalised, as the timeline has shifted before.
-
-- The regime is mandated in phases: companies with annual revenue **exceeding AED 50m from 1 Jan 2027**, companies with revenue **below AED 50m from 1 Jul 2027**, and **government entities from 1 Oct 2027**.
-- Each electronic invoice must carry both a **sequential invoice number** and a unique **UUID** for traceability and duplicate prevention.
-- Invoices must be **retained for seven years**.
-
-Source: [EDICOM — Electronic Invoicing in the United Arab Emirates](https://edicomgroup.com/electronic-invoicing/united-arab-emirates).
+3. Webhook payload format, authentication (HMAC / IP allowlist), retry policy, and registration endpoint.
+4. Idempotency-key support and the status-query endpoint (`GET /messages`) format for the reconciler.
+5. Rate limits, throttling headers (`Retry-After`), and recommended concurrency.
+6. Error taxonomy — which codes are permanent vs. transient — to finalise fault classification.
+7. Who assigns the invoice UUID (us or EDICOM) and how it is returned on acknowledgement.
