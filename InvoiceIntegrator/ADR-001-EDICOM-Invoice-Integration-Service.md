@@ -63,7 +63,6 @@ Each invoice — regardless of whether it was discovered by the cron batch or su
 
 ### Consequences
 
-- Good, because the source database is never written to — all state lives in `invint.InvoiceIntegration`.
 - Good, because `UNIQUE(InvoiceNumber)` makes double-dispatch impossible at the database level.
 - Good, because intake and processing are fully decoupled — both trigger types push to the same queue and share the same processor.
 - Good, because the webhook delivers terminal status with minimal latency; the reconciler ensures no invoice is silently stuck if the callback is missed.
@@ -72,7 +71,6 @@ Each invoice — regardless of whether it was discovered by the cron batch or su
 - Good, because atomic claim prevents duplicate processing across concurrent processor instances.
 - Bad, because the design introduces a message broker (queue + DLQ) that must be provisioned and monitored.
 - Bad, because EDICOM specifics (auth, exact payload, error codes, webhook format) are stubbed until their docs arrive.
-- Bad, because the stale claim recovery path relies on the next cron run re-discovering the invoice from the source — invoices will remain stuck if no new invoices arrive to trigger the processor. See [Stale Claim Recovery](#stale-claim-recovery) for mitigations.
 
 ---
 
@@ -80,7 +78,6 @@ Each invoice — regardless of whether it was discovered by the cron batch or su
 
 The decision is being followed if:
 
-- No code path issues an `INSERT`, `UPDATE`, `DELETE`, or DDL against the **source** database — the source connection uses a read-only login and architecture tests assert the source repository exposes only read methods.
 - `invint.InvoiceIntegration` has a `UNIQUE` constraint on `InvoiceNumber`; an integration test proves a second intake of the same invoice number upserts (not duplicates) the row.
 - The EDICOM HTTP client is referenced **only** in the infrastructure adapter and nowhere in the Application layer (NetArchTest rule).
 - Every invoice that leaves `WaitingConfirmation` has a recorded terminal outcome (`Acknowledged` or `Failed`) with a timestamp and, on success, the EDICOM `transactionId`.
