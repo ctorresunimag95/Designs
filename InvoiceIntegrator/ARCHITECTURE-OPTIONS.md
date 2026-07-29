@@ -217,6 +217,7 @@ sequenceDiagram
   participant Rec as Reconciler Service
   participant IntDB as invint.InvoiceIntegration
   participant Edicom as EDICOM iPaaS
+  participant SrcDB as Source DB
 
   RCron->>Rec: fires (scheduled interval)
   Rec->>IntDB: query Status = WaitingConfirmation AND SubmittedAt < NOW() - GraceMinutes
@@ -235,6 +236,8 @@ sequenceDiagram
       Rec->>Rec: trigger alert
     end
   end
+  Rec->>SrcDB: Update Source DB with result status
+  SrcDB-->>Rec: updated
 ```
 
 ---
