@@ -51,9 +51,9 @@ The United Arab Emirates is introducing a mandatory e-invoicing regime built on 
 
 ## Decision Outcome
 
-**Chosen architecture: per-invoice queue-based processing with webhook + polling fallback.**
+**Chosen architecture: per-invoice queue-based processing with pre-assembled payloads, webhook + polling fallback.**
 
-Each invoice — regardless of whether it was discovered by the cron batch or submitted via HTTP — flows through the same intake path: an upsert into `invint.InvoiceIntegration` followed by publishing the invoice number to `InvoiceProcessingQueue`. The processor consumer claims rows atomically from the queue, enriches and submits each invoice individually to EDICOM, then records the EDICOM `transactionId` and advances status to `WaitingConfirmation`. EDICOM pushes the terminal status via a webhook callback (primary, lowest latency); a polling reconciler cron provides a safety net for any missed callbacks.
+Each invoice — regardless of whether it was discovered by the cron batch or submitted via HTTP — flows through the same intake path: data is gathered from the Source DB, the payload is assembled and validated, then an upsert into `invint.InvoiceIntegration` is made followed by publishing the **complete payload** to `InvoiceProcessingQueue`. The processor consumer claims rows atomically from the queue, validates the EDICOM payload, acquires an OAuth token, and submits each invoice individually to EDICOM, then records the EDICOM `transactionId` and advances status to `WaitingConfirmation`. EDICOM pushes the terminal status via a webhook callback (primary, lowest latency); a polling reconciler cron provides a safety net for any missed callbacks.
 
 **Chosen tracking store: `invint.InvoiceIntegration` in a SQL Server database we own.** A `UNIQUE(InvoiceNumber)` constraint is the hard deduplication guarantee. SQL Server is chosen for first-class transactional claim semantics (`UPDATE … OUTPUT`), natural joins against the source database, and the team's existing operational familiarity.
 
@@ -89,92 +89,61 @@ The decision is being followed if:
 
 ## Trigger & Data Flow
 
-Intake and processing are decoupled. Intake always upserts the invoice row and publishes a message; the processor consumes messages, claims the row atomically, and runs the same EDICOM submission pipeline.
+Intake and processing are decoupled. Intake discovers candidates from the Source DB, gathers all invoice data, assembles and validates the payload, then upserts the invoice row and publishes the **complete payload** to the queue. The processor consumes messages, claims the row atomically, validates the EDICOM payload, tokenizes, and submits to EDICOM.
 
 ```mermaid
 flowchart LR
   subgraph triggers["Triggers"]
-    direction TB
     cron([Timer Cron])
     http([HTTP /trigger/invoice])
   end
 
-  subgraph intake["Trigger Intake — executes on each trigger"]
-    direction TB
-    discover["Find candidate invoices\nfrom Source DB"]
-    upsert["Upsert invint.InvoiceIntegration\nStatus = Pending"]
-    publish[Publish invoiceNumber to queue]
+  subgraph sourcedb_box["Source System"]
+    sourcedb[("Source DB")]
   end
 
-  subgraph broker["Message Broker"]
-    direction TB
-    q[(InvoiceProcessingQueue)]
-    dlq[(Dead-Letter Queue)]
+  subgraph intake["Trigger Intake"]
+    intake_steps["Discover + Gather +<br/>Validate + Upsert"]
   end
 
-  subgraph proc["Processor Consumer — executes per message"]
-    direction TB
-    consume[Consume message]
-    claim["Atomic claim row\nStatus = Claimed"]
-    gather[Gather invoice data]
-    validate[Validate EDICOM payload]
-    token[Acquire / refresh OAuth token]
-    submit["POST /publish · per invoice"]
-    record["Record transactionId\nStatus = WaitingConfirmation"]
+  subgraph tracking["Tracking"]
+    table[("invint.InvoiceIntegration")]
   end
 
-  edicom{{EDICOM iPaaS}}
+  subgraph broker["Queue"]
+    q[("InvoiceProcessingQueue")]
+  end
+
+  subgraph proc["Processor Consumer"]
+    proc_steps["Claim + Validate +<br/>Token + Submit"]
+  end
+
+  subgraph edicom_sys["EDICOM iPaaS"]
+    edicom["API"]
+  end
 
   subgraph completion["Completion"]
-    direction TB
-    wh["Webhook handler\nVerify · write terminal status"]
-    rc([Reconciler Cron])
-    poll["Poll GET /messages\nby transactionId"]
+    wh["Webhook + Reconciler"]
   end
 
-  sourcedb[(Source DB)]
-  extapi[(External APIs)]
-  otherdb[(Other DBs / Config)]
-  table[(invint.InvoiceIntegration)]
-
-  cron -->|fires| discover
-  sourcedb -->|"query candidates"| discover
-  http -->|"fires with invoiceNumber"| upsert
-  discover --> upsert
-  upsert -->|persist| table
-  upsert --> publish
-  publish --> q
-  q -. max retries .-> dlq
-
-  q -->|delivers message| consume
-  consume --> claim
-  claim -->|persist| table
-  claim --> gather
-  sourcedb -->|"core invoice fields"| gather
-  extapi -->|"enrichment data"| gather
-  otherdb -->|"config & supplemental"| gather
-  gather --> validate
-  validate --> token
-  token --> submit
-  submit -->|POST| edicom
-  submit --> record
-  record -->|persist| table
-
-  edicom -->|"POST callback — primary"| wh
-  wh -->|"write Acknowledged / Failed"| table
-
-  rc -->|"polls WaitingConfirmation past grace period"| poll
-  poll -->|GET /messages| edicom
-  poll -->|"write Acknowledged / Failed"| table
+  triggers -->|discover| sourcedb_box
+  sourcedb_box -->|fetch| intake
+  intake -->|upsert| tracking
+  intake -->|publish| broker
+  broker -->|consume| proc
+  proc -->|submit| edicom_sys
+  edicom_sys -->|callback| completion
+  edicom_sys -->|poll| completion
+  completion -->|update| tracking
 ```
 
 ---
 
 ## Sequence Diagrams
 
-### 1. Timer Cron — Trigger Intake
+### 1. Timer Cron — Trigger Intake with Data Gathering
 
-Cron fires, discovers candidate invoices from Source DB, and publishes one message per invoice to the queue.
+Cron fires, discovers candidate invoices from Source DB, gathers all invoice data in a single pass, and publishes one complete payload per invoice to the queue.
 
 ```mermaid
 sequenceDiagram
@@ -189,59 +158,61 @@ sequenceDiagram
   SrcDB-->>Intake: invoice list
 
   loop for each candidate invoice
+    Intake->>SrcDB: fetch all invoice data
+    SrcDB-->>Intake: invoice data (complete payload)
+
+    Intake->>Intake: validate payload structure
+
     Intake->>IntDB: UPSERT invoiceNumber (Status = Pending)
     IntDB-->>Intake: row upserted / refreshed
-    Intake->>Queue: publish invoiceNumber
+    Intake->>Queue: publish complete payload
     Queue-->>Intake: acknowledged
   end
 ```
 
-### 2. HTTP Manual Trigger — Intake
+### 2. HTTP Manual Trigger — Intake with Data Gathering
 
-An external caller submits a single invoice number. Intake upserts one row and publishes one message.
+An external caller submits a single invoice number. The trigger handler gathers all invoice data using the same logic as the cron intake and publishes one complete payload.
 
 ```mermaid
 sequenceDiagram
   participant Caller as External Caller
   participant Handler as HTTP Trigger Handler
+  participant SrcDB as Source DB
   participant IntDB as invint.InvoiceIntegration
   participant Queue as InvoiceProcessingQueue
 
   Caller->>Handler: POST /trigger/invoice {invoiceNumber}
+
+  Handler->>SrcDB: fetch all invoice data
+  SrcDB-->>Handler: invoice data (complete payload)
+
+  Handler->>Handler: validate payload structure
+
   Handler->>IntDB: UPSERT invoiceNumber (Status = Pending)
   IntDB-->>Handler: row upserted / refreshed
-  Handler->>Queue: publish invoiceNumber
+  Handler->>Queue: publish complete payload
   Queue-->>Handler: acknowledged
   Handler-->>Caller: 202 Accepted
 ```
 
-### 3. Processor Consumer — Claim, Enrich, and Submit
+### 3. Processor Consumer — Validate and Submit
 
-The processor consumes a queue message, claims the row, gathers all data from multiple sources, and submits to EDICOM.
+The processor consumes a queue message (containing the complete payload), claims the row, validates the EDICOM payload, acquires a token, and submits to EDICOM.
 
 ```mermaid
 sequenceDiagram
   participant Queue as InvoiceProcessingQueue
   participant Proc as Processor Consumer
   participant IntDB as invint.InvoiceIntegration
-  participant SrcDB as Source DB
-  participant OtherDB as Other DBs / Config
-  participant ExtAPI as External APIs
   participant Auth as Auth Server
   participant Edicom as EDICOM iPaaS
 
-  Queue->>Proc: deliver message (invoiceNumber)
+  Queue->>Proc: deliver message with complete payload
   Proc->>IntDB: atomic claim row (Status = Claimed)
   IntDB-->>Proc: row claimed
 
-  Proc->>SrcDB: fetch core invoice fields
-  SrcDB-->>Proc: invoice data
-  Proc->>OtherDB: fetch config & supplemental data
-  OtherDB-->>Proc: supplemental data
-  Proc->>ExtAPI: fetch enrichment data
-  ExtAPI-->>Proc: enrichment data
-
-  Proc->>Proc: validate full EDICOM payload
+  Proc->>Proc: validate EDICOM payload (structure & business rules)
 
   Proc->>Auth: POST /token (grant_type=password, scope=openid)
   Auth-->>Proc: {access_token, expires_in: 3600}
@@ -265,7 +236,6 @@ sequenceDiagram
   participant Edicom as EDICOM iPaaS
   participant WH as Webhook Handler
   participant IntDB as invint.InvoiceIntegration
-  participant SrcDB as Source DB
 
   Edicom->>WH: POST /webhook {transactionId, status, edicomReference, errorCode?}
   WH->>WH: verify sender auth (HMAC / IP allowlist)
@@ -273,8 +243,6 @@ sequenceDiagram
   IntDB-->>WH: row found (WaitingConfirmation)
   WH->>IntDB: UPDATE Status = Acknowledged / Failed
   IntDB-->>WH: updated
-  WH->>SrcDB: Update Source DB with result status
-  SrcDB-->>WH: updated
   WH-->>Edicom: 200 OK
 ```
 
@@ -286,7 +254,6 @@ sequenceDiagram
   participant Rec as Reconciler Service
   participant IntDB as invint.InvoiceIntegration
   participant Edicom as EDICOM iPaaS
-  participant SrcDB as Source DB
 
   RCron->>Rec: fires (scheduled interval)
   Rec->>IntDB: query Status = WaitingConfirmation AND SubmittedAt < NOW() - GraceMinutes
@@ -305,8 +272,6 @@ sequenceDiagram
       Rec->>Rec: trigger alert
     end
   end
-  Rec->>SrcDB: Update Source DB with result status
-  SrcDB-->>Rec: updated
 ```
 
 ---
@@ -337,10 +302,11 @@ sequenceDiagram
 
 ```
 Intake (cron or HTTP)
-  └─ UPSERT → Pending → published to queue
+  └─ Discover + gather + validate payload
+  └─ UPSERT → Pending → published to queue (with complete payload)
 
 Processor receives message
-  └─ Claimed → gather + validate + submit to EDICOM
+  └─ Claimed → validate + tokenize + submit to EDICOM
   └─ WaitingConfirmation (transactionId recorded)
 
 Completion
@@ -380,7 +346,7 @@ WaitingConfirmation past GraceMinutes
 **EDICOM persistently down**
 
 ```
-Processor receives message
+Processor receives message (with complete payload)
   └─ Claimed → POST /publish → Polly retries (1s, 2s, 4s) → all fail
   └─ Circuit breaker opens → processor aborts
   └─ Message NOT acknowledged → queue redelivers
@@ -388,14 +354,15 @@ Processor receives message
 
 Next day cron fires
   └─ Re-discovers same invoice from Source DB
+  └─ Gathers data, validates payload
   └─ UPSERT resets → Pending
-  └─ Re-published to queue → processor retries
+  └─ Re-published to queue (with complete payload) → processor retries
 ```
 
 **Processor crash / DLQ**
 
 ```
-Processor receives message
+Processor receives message (with complete payload)
   └─ Claimed → crashes before acknowledging
   └─ Queue redelivers (count 2, 3, 4, 5)
   └─ Each redelivery: row is Claimed, not stale → processor cannot claim → abandons
@@ -403,7 +370,8 @@ Processor receives message
   └─ Alert: DLQ depth > 0
 
 Next day cron fires
-  └─ Re-discovers invoice → UPSERT resets → Pending → re-published
+  └─ Re-discovers invoice → gathers data, validates payload
+  └─ UPSERT resets → Pending → re-published (with complete payload)
   └─ Only recovers if root cause (processor bug) is fixed first
 ```
 
@@ -448,12 +416,13 @@ Do **not** retry HTTP 400 / 422 — these indicate a malformed payload. Log the 
 ```
 DAY 1 — Cron fires (08:00, once)
 ─────────────────────────────────────────────────────────
-  08:00  Cron fires → discovers INV-001 → UPSERT Status = Pending
-         └─ Publishes INV-001 to queue
+  08:00  Cron fires → discovers INV-001
+         └─ Gathers data, validates payload
+         └─ UPSERT Status = Pending
+         └─ Publishes INV-001 (complete payload) to queue
 
   08:02  Processor wakes up (queue message received)
          └─ Claim query runs → Status = Claimed, ClaimedAt = 08:02
-         └─ Gathers data, builds payload
          └─ POST /publish → EDICOM DOWN
             ├─ Retry 1 (1s)  → fails
             ├─ Retry 2 (2s)  → fails
@@ -469,49 +438,13 @@ DAY 2 — Cron fires (08:00, once)
 ─────────────────────────────────────────────────────────
   08:00  Cron fires → queries Source DB
          └─ Finds INV-001 (still unprocessed) + INV-002 (new)
+         └─ Gathers data for both, validates payloads
          └─ UPSERT INV-001 → resets Status = Pending  ← cron drives the retry
          └─ UPSERT INV-002 → Status = Pending
-         └─ Publishes both to queue
+         └─ Publishes both (complete payloads) to queue
 ```
 
 > **Result:** Stuck invoices are retried the next day when new invoices arrive and wake the processor. If no new invoices come in, the stuck invoice waits until the next cron run that finds any pending work.
-
-### Options to improve stale claim recovery
-
-**Option A — Housekeeping cron (operational)**
-
-Add a lightweight scheduled job (every 30 min) that re-publishes stale `Claimed` rows back to the queue independently of the daily trigger. Keeps retry cadence at 30 min regardless of whether new invoices arrive.
-
-```
-Every 30 min:
-  Query: Status = Claimed AND ClaimedAt < NOW() - ClaimTimeoutMinutes
-         AND StaleResetCount < MaxStaleResets
-  For each stale row:
-    └─ Increment StaleResetCount
-    └─ Reset Status = Pending
-    └─ Re-publish invoiceNumber to queue
-  If StaleResetCount >= MaxStaleResets:
-    └─ Status = Failed (MaxAttemptsExceeded)
-    └─ Trigger alert
-```
-
-**Option B — Dashboard / monitoring (observability)**
-
-Without adding a new cron, expose stuck invoices via a monitoring alert:
-
-```sql
-SELECT InvoiceNumber, ClaimedAt, StaleResetCount, FailureReason
-FROM   invint.InvoiceIntegration
-WHERE  Status = 'Claimed'
-  AND  StaleResetCount >= 2
-ORDER  BY ClaimedAt ASC
-```
-
-Alert when any row has `StaleResetCount >= 2`. Ops can reset rows to `Pending` manually when EDICOM recovers.
-
-> **Recommendation:** Option B has zero infrastructure cost. Add Option A only if next-day retry violates your SLA.
-
----
 
 ## Design Notes
 

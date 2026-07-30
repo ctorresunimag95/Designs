@@ -2,9 +2,9 @@
 
 ## Overview
 
-**Per-Invoice Submission with Webhook + Polling Fallback**
+**Per-Invoice Submission with Payload Pre-assembly and Webhook + Polling Fallback**
 
-Each invoice is submitted individually to EDICOM. Both trigger types (cron batch and HTTP single-invoice) flow through the same intake path, then the same processor pipeline. Status is received via webhook callback (primary, lowest latency) with an async polling reconciler as a safety net for any missed callbacks.
+Each invoice is submitted individually to EDICOM. Both trigger types (cron batch and HTTP single-invoice) gather all required data during **trigger intake** and publish a complete payload to the queue. The processor consumer then validates and submits to EDICOM. Status is received via webhook callback (primary, lowest latency) with an async polling reconciler as a safety net for any missed callbacks.
 
 > **Implementation plan:** see [IMPLEMENTATION-PHASES.md](IMPLEMENTATION-PHASES.md) for the phased delivery approach — payload builder first, EDICOM client behind an interface, triggers last.
 
@@ -12,7 +12,7 @@ Each invoice is submitted individually to EDICOM. Both trigger types (cron batch
 
 ## Trigger & Data Flow
 
-Trigger intake and processing are decoupled. Intake always upserts the invoice row in the integration table and then publishes a processor message. The processor consumes messages, claims the row atomically, and runs the same EDICOM flow.
+Trigger intake and processing are decoupled. Intake discovers candidate invoices, gathers all required data from multiple sources in a single pass, upserts the invoice row in the integration table, and then publishes the **complete payload** to the queue. The processor consumes messages, claims the row atomically, validates the payload, and submits to EDICOM.
 
 ```mermaid
 flowchart LR
@@ -25,21 +25,22 @@ flowchart LR
   subgraph intake["Trigger Intake — executes on each trigger"]
     direction TB
     discover["Find candidate invoices\nfrom Source DB"]
+    gather["Gather all invoice data\nfrom Source DB"]
+    validate_intake["Validate payload structure"]
     upsert["Upsert invint.InvoiceIntegration\nStatus = Pending"]
-    publish[Publish invoiceNumber to queue]
+    publish["Publish complete payload\nto queue"]
   end
 
   subgraph broker["Message Broker"]
     direction TB
-    q[(InvoiceProcessingQueue)]
+    q[(InvoiceProcessingQueue\ncontains full payload)]
     dlq[(Dead-Letter Queue)]
   end
 
   subgraph proc["Processor Consumer — executes per message"]
     direction TB
-    consume[Consume message]
+    consume[Consume message\nwith payload]
     claim["Atomic claim row\nStatus = Claimed"]
-    gather[Gather invoice data]
     validate[Validate EDICOM payload]
     token[Acquire / refresh OAuth token]
     submit["POST /publish · per invoice"]
@@ -56,14 +57,15 @@ flowchart LR
   end
 
   sourcedb[(Source DB)]
-  extapi[(External APIs)]
-  otherdb[(Other DBs / Config)]
   table[(invint.InvoiceIntegration)]
 
   cron -->|fires| discover
   sourcedb -->|"query candidates"| discover
-  http -->|"fires with invoiceNumber"| upsert
-  discover --> upsert
+  http -->|"fires with invoiceNumber"| discover
+  discover --> gather
+  sourcedb -->|"fetch all data"| gather
+  gather --> validate_intake
+  validate_intake --> upsert
   upsert -->|persist| table
   upsert --> publish
   publish --> q
@@ -72,11 +74,7 @@ flowchart LR
   q -->|delivers message| consume
   consume --> claim
   claim -->|persist| table
-  claim --> gather
-  sourcedb -->|"core invoice fields"| gather
-  extapi -->|"enrichment data"| gather
-  otherdb -->|"config & supplemental"| gather
-  gather --> validate
+  claim --> validate
   validate --> token
   token --> submit
   submit -->|POST| edicom
@@ -95,9 +93,9 @@ flowchart LR
 
 ## Sequence Diagrams
 
-### 1. Timer Cron — Trigger Intake
+### 1. Timer Cron — Trigger Intake with Data Gathering
 
-Cron fires, discovers candidate invoices from Source DB, and publishes one message per invoice to the queue.
+Cron fires, discovers candidate invoices from Source DB, gathers all invoice data in a single pass, and publishes one complete payload per invoice to the queue.
 
 ```mermaid
 sequenceDiagram
@@ -112,63 +110,65 @@ sequenceDiagram
   SrcDB-->>Intake: invoice list
 
   loop for each candidate invoice
+    Intake->>SrcDB: fetch all invoice data
+    SrcDB-->>Intake: invoice data (complete payload)
+    
+    Intake->>Intake: validate payload structure
+    
     Intake->>IntDB: UPSERT invoiceNumber (Status = Pending)
     IntDB-->>Intake: row upserted / refreshed
-    Intake->>Queue: publish invoiceNumber
+    Intake->>Queue: publish complete payload
     Queue-->>Intake: acknowledged
   end
 ```
 
 ---
 
-### 2. HTTP Manual Trigger — Intake
+### 2. HTTP Manual Trigger — Intake with Data Gathering
 
-An external caller submits a single invoice number. Intake upserts one row and publishes one message.
+An external caller submits a single invoice number. The trigger handler gathers all invoice data using the same logic as the cron intake and publishes one complete payload.
 
 ```mermaid
 sequenceDiagram
   participant Caller as External Caller
   participant Handler as HTTP Trigger Handler
+  participant SrcDB as Source DB
   participant IntDB as invint.InvoiceIntegration
   participant Queue as InvoiceProcessingQueue
 
   Caller->>Handler: POST /trigger/invoice {invoiceNumber}
+  
+  Handler->>SrcDB: fetch all invoice data
+  SrcDB-->>Handler: invoice data (complete payload)
+  
+  Handler->>Handler: validate payload structure
+  
   Handler->>IntDB: UPSERT invoiceNumber (Status = Pending)
   IntDB-->>Handler: row upserted / refreshed
-  Handler->>Queue: publish invoiceNumber
+  Handler->>Queue: publish complete payload
   Queue-->>Handler: acknowledged
   Handler-->>Caller: 202 Accepted
 ```
 
 ---
 
-### 3. Processor Consumer — Claim, Enrich, and Submit
+### 3. Processor Consumer — Validate and Submit
 
-The processor consumes a queue message, claims the row, gathers all data from multiple sources, and submits to EDICOM.
+The processor consumes a queue message (containing the complete payload), claims the row, validates the EDICOM payload, acquires a token, and submits to EDICOM.
 
 ```mermaid
 sequenceDiagram
   participant Queue as InvoiceProcessingQueue
   participant Proc as Processor Consumer
   participant IntDB as invint.InvoiceIntegration
-  participant SrcDB as Source DB
-  participant OtherDB as Other DBs / Config
-  participant ExtAPI as External APIs
   participant Auth as Auth Server
   participant Edicom as EDICOM iPaaS
 
-  Queue->>Proc: deliver message (invoiceNumber)
+  Queue->>Proc: deliver message with complete payload
   Proc->>IntDB: atomic claim row (Status = Claimed)
   IntDB-->>Proc: row claimed
 
-  Proc->>SrcDB: fetch core invoice fields
-  SrcDB-->>Proc: invoice data
-  Proc->>OtherDB: fetch config & supplemental data
-  OtherDB-->>Proc: supplemental data
-  Proc->>ExtAPI: fetch enrichment data
-  ExtAPI-->>Proc: enrichment data
-
-  Proc->>Proc: validate full EDICOM payload
+  Proc->>Proc: validate EDICOM payload (structure & business rules)
 
   Proc->>Auth: POST /token (grant_type=password, scope=openid)
   Auth-->>Proc: {access_token, expires_in: 3600}
@@ -239,6 +239,20 @@ sequenceDiagram
   Rec->>SrcDB: Update Source DB with result status
   SrcDB-->>Rec: updated
 ```
+
+---
+
+## Design Rationale: Pre-assembled Payloads
+
+**Why gather data at trigger intake instead of processor consumer?**
+
+1. **Decoupling:** Trigger intake and processor have independent failure modes. Data gathering at intake means source-system availability issues fail fast (before queue commitment).
+2. **Simpler processor:** The consumer becomes stateless—it only validates, tokenizes, and submits. No I/O in the hot path.
+3. **Earlier validation:** Payload structure is validated during intake; malformed invoices never enter the queue.
+4. **Idempotency safety:** If the processor crashes after submitting but before recording `WaitingConfirmation`, the same payload (not regenerated) can be retried.
+5. **Single data snapshot:** Each payload represents a consistent snapshot of the source system at intake time.
+
+**Shared data-gathering logic:** Both cron and HTTP triggers invoke the same `GatherInvoiceDataPoints()` function to ensure consistent data extraction and validation rules.
 
 ---
 
