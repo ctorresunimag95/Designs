@@ -15,23 +15,25 @@ We need an **internal system that extracts invoice datapoints from an existing l
 
 ```mermaid
 flowchart LR
-    classDef manual fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D
+    classDef source fill:#FEF9C3,stroke:#CA8A04,color:#713F12
     classDef auto fill:#DBEAFE,stroke:#2563EB,color:#1E3A5F
+    classDef manual fill:#FEE2E2,stroke:#DC2626,color:#7F1D1D
 
-    ARMS["ARMS System<br/>Gathers invoice data<br/>from source systems"]:::auto
+    EDW[("EDW<br/>(Data Warehouse)")]:::source
     
-    SourceDB[("SourceDB<br/>(stores all data)")]:::auto
-    
-    Job["Daily Job<br/>Sends invoices<br/>directly to brokers"]:::manual
+    subgraph arms_domain["ARMS Logical Domain"]
+        ARMS["ARMS System<br/>(receives copy of data)"]:::auto
+        Job["Daily Job<br/>Queries ARMS data"]:::manual
+    end
     
     Brokers["Broker Recipients"]:::manual
 
-    ARMS -->|"gather + store"| SourceDB
-    SourceDB -->|"query data"| Job
+    EDW -->|"collect data"| ARMS
+    ARMS -->|"query invoice data"| Job
     Job -->|"send invoices"| Brokers
 ```
 
-**Current state:** ARMS system handles both data collection and direct broker delivery in a manual daily job with no audit trail, no deduplication mechanism, and tight coupling between data aggregation and delivery.
+**Current state:** EDW collects data and sends a copy to ARMS. A manual daily job within ARMS queries the data and sends invoices directly to broker recipients with no audit trail, no deduplication mechanism, and tight coupling between data aggregation and delivery.
 
 ## Decision Drivers
 
@@ -54,7 +56,7 @@ flowchart LR
 
 **Chosen option: Option 1 — Two-service queue-based pipeline with Service Bus and dedicated tracking store**
 
-Two independently deployable Azure Function services (.NET 9) are introduced:
+Two independently deployable Azure Function services (.NET 10) are introduced:
 
 **SOA.InvoiceExtractor** — queries broker list from SQL Server, discovers candidate invoices for EDICOM submission (last N hours), gathers complete invoice data, assembles and validates the EDICOM payload, upserts status to `invint.InvoiceIntegration` with `UNIQUE(InvoiceNumber)` constraint (deduplication guarantee), and publishes the complete payload to `InvoiceProcessingQueue`.
 
