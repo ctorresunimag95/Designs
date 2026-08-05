@@ -35,22 +35,44 @@ sequenceDiagram
 
 ## Implementation Steps
 
-### 1. Register Function B as Enterprise Application (if not already)
+### 1. Register Function B in Entra ID
 
-- Function B needs an Entra ID registration
-- Define App Roles in the manifest (e.g., "api.reader", "api.writer")
+- Azure Portal → Entra ID → App registrations → New registration
+- Name: Function B
+- Register the app
+- **Define App Roles in the manifest:**
+  - Go to Manifest → Add the following roles:
+  ```json
+  "appRoles": [
+    {
+      "id": "12345678-1234-1234-1234-123456789012",
+      "allowedMemberTypes": ["Application"],
+      "displayName": "API Reader",
+      "value": "api.reader",
+      "description": "Read access to the API"
+    }
+  ]
+  ```
 
 ### 2. Assign Managed Identity to Function A
 
-- System-assigned or User-assigned managed identity
+- Azure Portal → Function A → Settings → Identity
+- System-assigned: Toggle Status to ON
+  - OR
+- User-assigned: Click Add → Select or create user-assigned identity
+- Copy the **Object ID** (you'll need this in step 3)
 
-### 3. Configure Role Assignment in Azure Portal
+### 3. Grant Function A Access to Function B
 
-- Go to Function B → Enterprise Application
-- Users and groups → Assign role to Function A's managed identity
-- Select the appropriate role (e.g., "api.reader")
+- Azure Portal → Entra ID → Enterprise applications → Search for Function B
+- Click the Function B enterprise app
+- Go to Users and groups → Add user/group
+- Click "None selected" → Search for Function A's managed identity
+- Select Function A's managed identity by Object ID
+- Assign the role (e.g., "API Reader")
+- Click Assign
 
-### 4. Function A Code
+### 4. Code Function A
 
 ```csharp
 using Azure.Identity;
@@ -68,7 +90,7 @@ client.DefaultRequestHeaders.Authorization =
 var response = await client.GetAsync("https://{functionb-uri}/api/endpoint");
 ```
 
-### 5. Function B Code (Azure Function)
+### 5. Code Function B
 
 ```csharp
 [FunctionName("MySecureFunction")]
