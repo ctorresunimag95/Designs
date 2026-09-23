@@ -217,3 +217,55 @@ sequenceDiagram
 Use **Option B (Entra External ID)** unless you have specific requirements for advanced CIAM flows (custom onboarding, complex consent, rich email journeys). In that case, use **Option C** — keeping Auth0 strictly for external users with no impact on the internal Entra path.
 
 **Option A** is viable only when Auth0 is already the org's strategic identity platform, internal Entra usage is shallow (no Conditional Access, no PIM), or external users will far outnumber internal users.
+
+---
+
+## Auth0 vs Entra External ID — Head to Head
+
+### For External Users (CIAM)
+
+| Capability | Auth0 | Entra External ID |
+|---|---|---|
+| Free tier | 25,000 MAU/mo | **50,000 MAU/mo** |
+| Overage pricing | $35–$2,100/mo (bucket tiers) | $0.00325/MAU above 50k |
+| Billing model | Flat tier (pick a bucket) | Pay-per-overage MAU |
+| User storage | Auth0 Directory | Microsoft-managed CIAM directory |
+| Social logins | Google, Facebook, Apple, GitHub, X, 40+ | Google, Facebook, Apple (fewer natively) |
+| Custom login UI | Fully customizable (Universal Login) | Customizable (Company Branding) |
+| Custom domain | Paid plans only | Included |
+| Email/passwordless | Yes (magic link, OTP) | Yes (email OTP) |
+| Progressive profiling | Yes (built-in Actions) | Limited (custom attributes only at sign-up) |
+| Sign-up/sign-in logic (custom code) | Yes — Actions (JS functions on auth events) | Limited — no arbitrary code execution |
+| MFA | TOTP, SMS, push, WebAuthn | TOTP, SMS, email OTP |
+| Self-service password reset | Yes | Yes |
+| Admin user management UI | Yes | Yes (Azure Portal) |
+| Graph API / management API | Yes (Auth0 Management API) | Yes (Microsoft Graph) |
+| Audit logs | Yes | Yes (Azure Monitor) |
+| GDPR / compliance | SOC2, ISO27001, HIPAA BAA | SOC2, ISO27001, HIPAA BAA, FedRAMP |
+
+### In General (Beyond External Users)
+
+| Dimension | Auth0 | Entra External ID |
+|---|---|---|
+| Primary purpose | CIAM (customer identity) | CIAM (customer identity) |
+| Internal workforce identity | Not designed for it (use Entra) | Not designed for it (use Entra internal tenant) |
+| Ecosystem lock-in | Auth0 / Okta ecosystem | Microsoft / Azure ecosystem |
+| Non-Azure integration | Excellent — provider-agnostic | Good — works anywhere but optimized for Azure |
+| Developer experience | Excellent docs, SDKs for all platforms | Good docs, MSAL SDKs mature |
+| Support | Ticket-based (paid plans) | Microsoft Support (Azure subscription) |
+| Vendor maturity | Okta-backed, widely adopted | Microsoft-backed, newer CIAM product |
+| Best fit | Complex CIAM needs, multi-platform, Auth0 already in org | Azure-native apps, simple-to-medium CIAM, cost-sensitive |
+
+### Cost Comparison at Scale
+
+| Monthly external MAU | Auth0 Essentials | Entra External ID |
+|---|---|---|
+| 1,000 | Free | Free |
+| 10,000 | Free | Free |
+| 25,000 | Free | Free |
+| 26,000 | $2,100 (30K bucket) | **Free** |
+| 50,000 | $2,100 (30K bucket) | **Free** |
+| 50,002 | contact sales | **$0.0065** |
+| 100,000 | contact sales | **$162.50** |
+
+> Entra External ID wins decisively on cost for most scenarios. Auth0 wins on CIAM feature depth and ecosystem breadth.
